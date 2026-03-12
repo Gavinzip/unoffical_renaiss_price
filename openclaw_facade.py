@@ -63,7 +63,10 @@ async def run_openclaw(image_path=None, mode="json", lang="zh", poster_version="
     if debug_dir:
         mrv._set_debug_dir(debug_dir)
 
-    api_key = (os.getenv("MINIMAX_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+    google_api_key = (os.getenv("GOOGLE_API_KEY") or "").strip()
+    openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    minimax_api_key = (os.getenv("MINIMAX_API_KEY") or "").strip()
+    has_any_llm_key = bool(google_api_key or openai_api_key or minimax_api_key)
     current_card_info = None
 
     # --- 階段 1: 取得卡片資訊 (Recognition Phase) ---
@@ -74,13 +77,13 @@ async def run_openclaw(image_path=None, mode="json", lang="zh", poster_version="
         if not image_path or not os.path.exists(image_path):
             return {"error": f"找不到圖片或未提供 card_info: {image_path}"}
             
-        is_llm_mode = bool(api_key)
-        vision_mode_str = "LLM (OpenAI/MiniMax)" if is_llm_mode else f"Native ({APP_NAME})"
+        is_llm_mode = bool(has_any_llm_key)
+        vision_mode_str = "LLM (Google Gemini/OpenAI/MiniMax)" if is_llm_mode else f"Native ({APP_NAME})"
         print(f"📡 [{APP_NAME}] 辨識模式: {vision_mode_str}")
 
         if is_llm_mode:
             print(f"🔍 [{APP_NAME}] 執行 LLM 辨識 | 處理圖片: {os.path.basename(image_path)}")
-            res = await mrv.process_image_for_candidates(image_path, api_key, lang=lang)
+            res = await mrv.process_image_for_candidates(image_path, minimax_api_key, lang=lang)
             if res and len(res) >= 1:
                 current_card_info = _normalize_card_info(res[0], native_mode=False)
             else:
@@ -116,7 +119,7 @@ async def run_openclaw(image_path=None, mode="json", lang="zh", poster_version="
             # 將 stream_mode 改為 False，強制產生海報圖片
             result = await mrv.process_single_image(
                 image_path,
-                api_key,
+                minimax_api_key,
                 out_dir=debug_dir,
                 stream_mode=False,
                 poster_version=poster_version,

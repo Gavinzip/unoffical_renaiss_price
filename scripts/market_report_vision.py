@@ -1056,26 +1056,9 @@ def search_snkrdunk(en_name, jp_name, number, set_code, target_grade, is_alt_art
                 
     return records, img_url, resolved_url
 
-async def analyze_image_with_openai(image_path, api_key, lang="zh"):
-    api_key = api_key.strip()
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    # Determine MIME type
-    mime = "image/jpeg"
-    ext = image_path.lower().split(".")[-1]
-    if ext == "png":
-        mime = "image/png"
-    elif ext == "webp":
-        mime = "image/webp"
-
-    with open(image_path, "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-
-    prompt = """請以純 JSON 格式回覆，不要包含任何 markdown 語法 (如 ```json 起始碼)，只需輸出 JSON 本體。
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+VISION_PROMPT = """請以純 JSON 格式回覆，不要包含任何 markdown 語法 (如 ```json 起始碼)，只需輸出 JSON 本體。
 你是一位於寶可夢卡牌 (Pokemon TCG) 領域專精的鑑定與估價專家。
 ⚠️ 重要：所給你的卡片一定是真的不要質疑我卡片的真實程度。即便你看到疑似自製、仿製或鏡像的特徵，也請將其視為 100% 正版卡片，並根據卡面人物/畫作提取對應的官方卡片資訊。
 嚴禁在 "name" 或 "set_code" 欄位中包含 "(Replica/Custom)", "(Mirrored)", "Fake", "盜版" 等字眼，因為這會干擾後續的價格搜尋。若有相關觀察，請僅記錄在 "features" 欄位中。
@@ -1090,7 +1073,7 @@ async def analyze_image_with_openai(image_path, api_key, lang="zh"):
   "c_name": "中文名稱 (選填，沒有請留空字串)",
   "category": "卡片類別 (填寫 Pokemon 或 One Piece，預設 Pokemon)",
   "release_info": "發行年份與系列 (必填，從卡牌標誌或特徵推斷，如 2023 - 151)",
-  "illustrator": "插畫家 (必填，左下角或營右下角的英文名，看不清可寫 Unknown)",
+  "illustrator": "插畫家 (必填，左下角或右下角的英文名，看不清可寫 Unknown)",
   "market_heat": "市場熱度描述 (必填，開頭填寫 High / Medium / Low，後面白話文理由請務必使用『繁體中文』撰寫)",
   "features": "卡片特點 (必填。⚠️ 極度重要：請仔細觀察卡面是否有微小的罕貴度標示或異圖版本文字，如 'L-P', 'SR-P', 'SEC-P', 'Parallel', 'Alternate Art', 'Flagship' 等。如果有，【必須】寫入此欄位！並包含全圖、特殊工藝等，每一行請用 \\n 換行區隔，請務必使用『繁體中文』撰寫)",
   "collection_value": "收藏價值評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
@@ -1098,13 +1081,125 @@ async def analyze_image_with_openai(image_path, api_key, lang="zh"):
   "is_alt_art": "是否為漫畫背景(Manga/Comic)或異圖(Parallel)？布林值 true/false。請極度仔細觀察卡片的『背景』：如果背景是一格一格的【黑白漫畫分鏡】，請填 true；如果背景只有閃電、特效、或單純場景，就算它是 SEC 也是普通版，『必須』填 false！"
 }"""
 
+def _get_image_mime_type(image_path):
+    mime = "image/jpeg"
+    ext = image_path.lower().split(".")[-1]
+    if ext == "png":
+        return "image/png"
+    if ext == "webp":
+        return "image/webp"
+    return mime
+
+def _parse_vision_json(content):
+    cleaned = (content or "").replace("```json", "").replace("```", "").strip()
+    return json.loads(cleaned)
+
+def _get_llm_keys(minimax_api_hint=None):
+    google_key = (os.getenv("GOOGLE_API_KEY") or "").strip()
+    openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    minimax_key = (minimax_api_hint or os.getenv("MINIMAX_API_KEY") or "").strip()
+    return {
+        "google": google_key,
+        "openai": openai_key,
+        "minimax": minimax_key,
+    }
+
+def _get_provider_order():
+    preferred = (os.getenv("VISION_PROVIDER") or "google").strip().lower()
+    providers = ["google", "openai", "minimax"]
+    if preferred in providers:
+        return [preferred] + [p for p in providers if p != preferred]
+    return providers
+
+async def analyze_image_with_google(image_path, api_key, lang="zh"):
+    api_key = api_key.strip().replace("\u2028", "").replace("\n", "").replace("\r", "")
+    model = (os.getenv("GOOGLE_VISION_MODEL") or os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+    if model.startswith("models/"):
+        model = model.split("/", 1)[1]
+    mime = _get_image_mime_type(image_path)
+
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    headers = {"Content-Type": "application/json"}
     payload = {
-        "model": "gpt-4o-mini",
+        "contents": [{
+            "parts": [
+                {"text": VISION_PROMPT},
+                {"inline_data": {"mime_type": mime, "data": encoded_string}},
+            ]
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+        },
+    }
+
+    print("--------------------------------------------------")
+    print(f"👁️‍🗨️ [Google Gemini] 模型={model}，正在解析卡片影像: {image_path}...")
+
+    loop = asyncio.get_running_loop()
+
+    def _do_google_post():
+        for attempt in range(3):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=60)
+                response.raise_for_status()
+                return response
+            except requests.exceptions.RequestException as e:
+                print(f"⚠️ Google Gemini API 網路錯誤 (嘗試 {attempt+1}/3): {e}")
+                if attempt == 2:
+                    return None
+                time.sleep(2)
+        return None
+
+    response = await loop.run_in_executor(None, _do_google_post)
+    if response is None:
+        return None
+
+    try:
+        data = response.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise ValueError("candidates 為空")
+        parts = (((candidates[0] or {}).get("content") or {}).get("parts") or [])
+        text_part = ""
+        for part in parts:
+            if isinstance(part, dict) and part.get("text"):
+                text_part = part["text"]
+                break
+        if not text_part:
+            raise ValueError("Gemini 回傳未包含 text")
+        result = _parse_vision_json(text_part)
+        print(f"✅ 解析成功！提取到卡片：{result.get('name')} #{result.get('number')}\n")
+        _debug_log(f"Step 1 OK [Gemini]: {result.get('name')} #{result.get('number')}")
+        _debug_save("step1_google.json", json.dumps(result, indent=2, ensure_ascii=False))
+        return result
+    except Exception as e:
+        print(f"❌ Google Gemini 解析失敗: {e}")
+        return None
+
+async def analyze_image_with_openai(image_path, api_key, lang="zh"):
+    api_key = api_key.strip()
+    url = "https://api.openai.com/v1/chat/completions"
+    model = (os.getenv("OPENAI_VISION_MODEL") or DEFAULT_OPENAI_MODEL).strip()
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    mime = _get_image_mime_type(image_path)
+
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+
+    payload = {
+        "model": model,
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": VISION_PROMPT},
                     {
                         "type": "image_url",
                         "image_url": {"url": f"data:{mime};base64,{encoded_string}"}
@@ -1130,7 +1225,10 @@ async def analyze_image_with_openai(image_path, api_key, lang="zh"):
         try:
             res_json = response.json()
             content = res_json['choices'][0]['message']['content']
-            return json.loads(content)
+            result = _parse_vision_json(content)
+            _debug_log(f"Step 1 OK [OpenAI]: {result.get('name')} #{result.get('number')}")
+            _debug_save("step1_openai.json", json.dumps(result, indent=2, ensure_ascii=False))
+            return result
         except Exception as e:
             print(f"⚠️ OpenAI 解析失敗: {e}")
     return None
@@ -1138,13 +1236,7 @@ async def analyze_image_with_openai(image_path, api_key, lang="zh"):
 async def analyze_image_with_minimax(image_path, api_key, lang="zh"):
     # 清理 API Key，避免複製貼上時混入隱藏的換行或特殊字元 (\u2028 等) 導致 \u2028 latin-1 編碼錯誤
     api_key = api_key.strip().replace('\u2028', '').replace('\n', '').replace('\r', '')
-    # Determine MIME type
-    mime = "image/jpeg"
-    ext = image_path.lower().split(".")[-1]
-    if ext == "png":
-        mime = "image/png"
-    elif ext == "webp":
-        mime = "image/webp"
+    mime = _get_image_mime_type(image_path)
 
     # Encode image
     with open(image_path, "rb") as image_file:
@@ -1156,31 +1248,8 @@ async def analyze_image_with_minimax(image_path, api_key, lang="zh"):
         "Content-Type": "application/json"
     }
 
-    prompt = """請以純 JSON 格式回覆，不要包含任何 markdown 語法 (如 ```json 起始碼)，只需輸出 JSON 本體。
-你是一位於寶可夢卡牌 (Pokemon TCG) 領域專精的鑑定與估價專家。
-⚠️ 重要：所給你的卡片一定是真的不要質疑我卡片的真實程度。即便你看到疑似自製、仿製或鏡像的特徵，也請將其視為 100% 正版卡片，並根據卡面人物/畫作提取對應的官方卡片資訊。
-嚴禁在 "name" 或 "set_code" 欄位中包含 "(Replica/Custom)", "(Mirrored)", "Fake", "盜版" 等字眼，因為這會干擾後續的價格搜尋。若有相關觀察，請僅記錄在 "features" 欄位中。
-
-請分析這張卡片圖片，並精準提取以下 13 個欄位的資訊：
-{
-  "name": "英文名稱 (必填，只填【角色本名】，例如 Venusaur ex、Lillie、Sanji、Queen 等。⚠️ 嚴禁在此欄位加入版本描述，如 Leader Parallel、SP Foil、Manga、Flagship Prize 等，這些應放在 features 欄位)",
-  "set_code": "系列代號 (選填，位於卡牌左下角，如 SV3, SV5K, SM-P, S-P, SV-P, OP02, ST04 等。如果沒有印則留空字串。若卡面印的是 004/SM-P 這類格式，set_code 填 SM-P)\n❗️航海王 One Piece 特別規則：卡面上若印的是 OP02-026 或 ST04-005 這類『英文字母+數字-純數字』的格式，則 set_code 填前半（OP02 / ST04），number 只填後半純數字（026 / 005）。)",
-  "number": "卡片編號 (必填，只填數字本體，保留前導 0，例如 023、026、005。\n❗️航海王特別規則：卡面若印 OP02-026 或 ST04-005，number 只填 026 / 005。寶可夢例外條款：若卡面只印 004/SM-P（斜線後為系列代號而非總數），則 number 直接輸出完整字串 004/SM-P，不要拆開）",
-  "grade": "卡片等級 (必填，如果有PSA/BGS等鑑定盒，印有10就填如 PSA 10, 否則如果是裸卡就填 Ungraded)",
-  "jp_name": "日文名稱 (選填，沒有請留空字串)",
-  "c_name": "中文名稱 (選填，沒有請留空字串)",
-  "category": "卡片類別 (填寫 Pokemon 或 One Piece，預設 Pokemon)",
-  "release_info": "發行年份與系列 (必填，從卡牌標誌或特徵推斷，如 2023 - 151)",
-  "illustrator": "插畫家 (必填，左下角或右下角的英文名，看不清可寫 Unknown)",
-  "market_heat": "市場熱度描述 (必填，開頭填寫 High / Medium / Low，後面白話文理由請務必使用『繁體中文』撰寫)",
-  "features": "卡片特點 (必填。⚠️ 極度重要：請仔細觀察卡面是否有微小的罕貴度標示或異圖版本文字，如 'L-P', 'SR-P', 'SEC-P', 'Parallel', 'Alternate Art', 'Flagship' 等。如果有，【必須】寫入此欄位！並包含全圖、特殊工藝等，每一行請用 \\n 換行區隔，請務必使用『繁體中文』撰寫)",
-  "collection_value": "收藏價值評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
-  "competitive_freq": "競技頻率評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
-  "is_alt_art": "是否為漫畫背景(Manga/Comic)或異圖(Parallel)？布林值 true/false。請極度仔細觀察卡片的『背景』：如果背景是一格一格的【黑白漫畫分鏡】，請填 true；如果背景只有閃電、特效、或單純場景，就算它是 SEC 也是普通版，『必須』填 false！"
-}"""
-
     payload = {
-        "prompt": prompt,
+        "prompt": VISION_PROMPT,
         "image_url": f"data:{mime};base64,{encoded_string}"
     }
 
@@ -1205,26 +1274,15 @@ async def analyze_image_with_minimax(image_path, api_key, lang="zh"):
         return None
 
     response = await loop.run_in_executor(None, _do_minimax_post)
-
-    # 如果 Minimax API 全部嘗試失敗，則嘗試 OpenAI 作為備援
     if response is None:
-        print(f"⚠️ Minimax API 請求失敗，嘗試切換至 GPT-4o-mini...")
-        _push_notify("⚠️ Minimax API 無回應，切換至 GPT-4o-mini 備援重試...")
-        openai_key = os.getenv("OPENAI_API_KEY")
-        if openai_key:
-            return await analyze_image_with_openai(image_path, openai_key)
-        else:
-            print("❌ 未設定 OPENAI_API_KEY，無法進行備援。")
-            return None
+        return None
 
     data = response.json()
     try:
         content = data.get('content', '')
         if not content:
             raise KeyError("content key not found or empty")
-        # Clean up markdown JSON block if model still outputs it
-        content = content.replace("```json", "").replace("```", "").strip()
-        result = json.loads(content)
+        result = _parse_vision_json(content)
         print(f"✅ 解析成功！提取到卡片：{result.get('name')} #{result.get('number')}\n")
         print("--- DEBUG JSON ---")
         print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -1235,19 +1293,48 @@ async def analyze_image_with_minimax(image_path, api_key, lang="zh"):
         return result
     except Exception as e:
         print(f"❌ Minimax 解析失敗: {e}")
-        print(f"⚠️ 嘗試切換至 GPT-4o-mini 進行備援...")
-        _push_notify("⚠️ Minimax 解析失敗，切換至 GPT-4o-mini 備援重試...")
-        openai_key = os.getenv("OPENAI_API_KEY")
-        if openai_key:
-            return await analyze_image_with_openai(image_path, openai_key)
+        return None
+
+async def analyze_image_with_fallbacks(image_path, minimax_api_hint=None, lang="zh"):
+    keys = _get_llm_keys(minimax_api_hint)
+    providers = _get_provider_order()
+    available = [p for p in providers if keys.get(p)]
+    if not available:
+        print("❌ 未設定任何視覺 API Key（GOOGLE_API_KEY / OPENAI_API_KEY / MINIMAX_API_KEY）")
+        return None
+
+    provider_titles = {
+        "google": "Google Gemini",
+        "openai": "OpenAI",
+        "minimax": "MiniMax",
+    }
+    _debug_log(f"Vision provider order: {available}")
+
+    for idx, provider in enumerate(available):
+        if idx > 0:
+            prev = provider_titles.get(available[idx - 1], available[idx - 1])
+            cur = provider_titles.get(provider, provider)
+            _push_notify(f"⚠️ {prev} 無法辨識，切換至 {cur} 備援重試...")
+            print(f"⚠️ {prev} 辨識失敗，切換至 {cur}...")
         else:
-            print("❌ 未設定 OPENAI_API_KEY，無法進行備援。")
-            return None
+            print(f"🧭 視覺辨識供應商順序: {' -> '.join(provider_titles.get(p, p) for p in available)}")
+
+        if provider == "google":
+            result = await analyze_image_with_google(image_path, keys["google"], lang=lang)
+        elif provider == "openai":
+            result = await analyze_image_with_openai(image_path, keys["openai"], lang=lang)
+        else:
+            result = await analyze_image_with_minimax(image_path, keys["minimax"], lang=lang)
+
+        if result:
+            return result
+
+    return None
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_path", nargs='+', required=True, help="卡片圖片的本機路徑 (可傳入多張圖片)")
-    parser.add_argument("--api_key", required=False, help="Minimax API Key (若未指定，則從環境變數 MINIMAX_API_KEY 讀取)")
+    parser.add_argument("--api_key", required=False, help="MiniMax API Key 覆寫值 (若未指定，則讀取環境變數 MINIMAX_API_KEY)")
     parser.add_argument("--out_dir", required=False, help="若指定，會將結果儲存至給定的資料夾")
     parser.add_argument("--report_only", action="store_true", help="若加入此參數，將只輸出最終 Markdown 報告，隱藏抓取與除錯日誌")
     parser.add_argument("--debug", required=False, metavar="DEBUG_DIR",
@@ -1267,8 +1354,10 @@ def main():
         _original_print(f"🔍 Debug 模式開啟，Session 根目錄: {debug_session_root}")
     
     api_key = args.api_key or os.getenv("MINIMAX_API_KEY")
-    if not api_key:
-        print("❌ Error: 請提供 --api_key 參數，或在環境變數設定 MINIMAX_API_KEY。", force=True)
+    google_key = os.getenv("GOOGLE_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not ((api_key and api_key.strip()) or (google_key and google_key.strip()) or (openai_key and openai_key.strip())):
+        print("❌ Error: 請設定 GOOGLE_API_KEY / OPENAI_API_KEY / MINIMAX_API_KEY 其中至少一個。", force=True)
         return
         
     total = len(args.image_path)
@@ -1315,22 +1404,9 @@ async def process_single_image(
         card_info = external_card_info
         print("📡 使用外部 card_info，跳過影像辨識。")
     else:
-        openai_key = os.getenv("OPENAI_API_KEY")
-        if openai_key:
-            card_info = await analyze_image_with_openai(image_path, openai_key, lang=lang)
-            if not card_info:
-                _push_notify("⚠️ GPT-4o-mini 無回應，切換至 Minimax 備援重試...")
-                print("⚠️ GPT-4o-mini 辨識失敗，切換至 Minimax...")
-                card_info = await analyze_image_with_minimax(image_path, api_key, lang=lang)
-        else:
-            print("⚠️ 未設定 OPENAI_API_KEY，直接使用 Minimax 辨識。")
-            card_info = await analyze_image_with_minimax(image_path, api_key, lang=lang)
-
+        card_info = await analyze_image_with_fallbacks(image_path, api_key, lang=lang)
         if not card_info:
-            if not openai_key:
-                err_msg = "❌ 卡片辨識失敗：未設定 OPENAI_API_KEY，且 Minimax API 亦無回應。請聯繫管理員設定 OpenAI 金鑰。"
-            else:
-                err_msg = "❌ 卡片影像辨識失敗：GPT-4o-mini 及 Minimax 備援均無法解析此圖片，請確認圖片清晰度並重試。"
+            err_msg = "❌ 卡片影像辨識失敗：Google Gemini / OpenAI / MiniMax 均無法解析此圖片，請確認圖片清晰度與 API 金鑰。"
             print(err_msg, force=True)
             return err_msg
 
@@ -1681,14 +1757,8 @@ async def process_image_for_candidates(image_path, api_key, lang="zh"):
     """(Manual Mode) Analyzes image and returns URL candidates from PC and SNKRDUNK."""
     if not os.path.exists(image_path):
         return None, "找不到圖片檔案"
-        
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if openai_key:
-        card_info = await analyze_image_with_openai(image_path, openai_key, lang=lang)
-        if not card_info:
-            card_info = await analyze_image_with_minimax(image_path, api_key, lang=lang)
-    else:
-        card_info = await analyze_image_with_minimax(image_path, api_key, lang=lang)
+
+    card_info = await analyze_image_with_fallbacks(image_path, api_key, lang=lang)
     if not card_info:
         return None, "卡片影像辨識失敗"
     

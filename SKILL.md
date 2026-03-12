@@ -1,5 +1,12 @@
 # unoffical_renaiss_price Skill 🐾
 
+**Version: v1.1**
+
+**v1.1 更新重點**
+- 新增 Google Gemini 視覺辨識支援 (`GOOGLE_API_KEY`)
+- 預設辨識模型改為 Gemini 3 Flash (`gemini-3-flash-preview`)
+- 辨識備援順序：Google Gemini -> OpenAI -> MiniMax
+
 Welcome to **unoffical_renaiss_price**, the high-performance TCG intelligence engine. This guide ensures that both human developers and AI agents can achieve professional results in seconds.
 
 ---
@@ -10,6 +17,11 @@ Welcome to **unoffical_renaiss_price**, the high-performance TCG intelligence en
 Create a `.env` file in the project root to unlock full capabilities:
 
 ```env
+# Default primary vision provider (recommended)
+GOOGLE_API_KEY=your_google_key_here
+# Optional: override model name (default is gemini-3-flash-preview)
+GEMINI_MODEL=gemini-3-flash-preview
+
 # Essential for Japanese cards & precise text recognition
 MINIMAX_API_KEY=your_minimax_key_here
 
@@ -18,6 +30,8 @@ OPENAI_API_KEY=your_openai_key_here
 ```
 > [!IMPORTANT]
 > **Native Mode**: If these keys are missing, unoffical_renaiss_price enters "Native Mode," performing basic identification using only file metadata.
+>
+> Vision fallback order (default): `Google Gemini (gemini-3-flash-preview)` -> `OpenAI` -> `MiniMax`.
 
 ### 2. Choose Your Entry Flow
 | Flow | Best For | Requirement |
@@ -79,7 +93,7 @@ If you prefer not to write JSON manually, or if you want the script's built-in L
 python3 openclaw_facade.py "path/to/downloaded/image.jpg" --mode full --poster_version v3
 ```
 
-*Note: This flow requires `MINIMAX_API_KEY` or `OPENAI_API_KEY` to be set in the `.env` file to function properly.*
+*Note: This flow requires at least one of `GOOGLE_API_KEY` / `OPENAI_API_KEY` / `MINIMAX_API_KEY` to be set in `.env`. Default first choice is Gemini 3 Flash.*
 
 ---
 
