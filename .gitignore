@@ -6,3 +6,5 @@ __pycache__/
 /.vscode
 .DS_Store
 /AGENT_LOCAL_NOTICE.md
+debug_*/
+sample_outputs/
