@@ -23,6 +23,7 @@ def _normalize_card_info(card_info, native_mode=False):
         "number": "Unknown",
         "set_code": "",
         "grade": "Ungraded",
+        "language": "Unknown",
         "jp_name": "",
         "c_name": "",
         "category": "Pokemon",
@@ -49,6 +50,13 @@ def _normalize_card_info(card_info, native_mode=False):
 
     if isinstance(data.get("is_alt_art"), str):
         data["is_alt_art"] = data["is_alt_art"].strip().lower() == "true"
+    # Keep language in a stable tri-state form for SNKRDUNK tie-break.
+    if str(data.get("language", "")).strip().upper() in {"EN", "ENGLISH"}:
+        data["language"] = "EN"
+    elif str(data.get("language", "")).strip().upper() in {"JP", "JA", "JAPANESE"}:
+        data["language"] = "JP"
+    else:
+        data["language"] = "Unknown"
 
     return data
 
@@ -153,7 +161,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="unoffical_renaiss_price: TCG Vision & Market Intelligence")
     parser.add_argument("image", nargs="?", help="Path to the card image (optional if --json or --json_file is provided)")
     parser.add_argument("--mode", choices=["json", "full"], default="json", help="Mode: json (recognition) or full (report)")
-    parser.add_argument("--lang", choices=["zh", "en"], default="zh", help="Language for output")
+    parser.add_argument("--lang", choices=["zh", "zhs", "en", "ko"], default="zh", help="Language for output")
     parser.add_argument(
         "--poster_version",
         choices=["v1", "v3", "b3"],

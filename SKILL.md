@@ -1,11 +1,15 @@
 # unoffical_renaiss_price Skill 🐾
 
-**Version: v1.1**
+**Version: v1.2**
 
-**v1.1 更新重點**
+**v1.2 更新重點**
 - 新增 Google Gemini 視覺辨識支援 (`GOOGLE_API_KEY`)
 - 預設辨識模型改為 Gemini 3 Flash (`gemini-3-flash-preview`)
 - 辨識備援順序：Google Gemini -> OpenAI -> MiniMax
+- PriceCharting 分級邏輯改為嚴格 PSA：`PSA 10` 不再混入 `CGC/BGS/SGC 10`
+- Flow A 外部 JSON 新增 `language` 欄位 (`EN` / `JP` / `Unknown`) 供 SNKRDUNK 平手時 tie-break
+- 報告與海報新增 Gemrate PSA 統計（總數、PSA10、PSA9、PSA8以下、滿分率）
+- v3 海報樣式更新：PSA 區塊 + Global 區塊共用同一個外層容器
 
 Welcome to **unoffical_renaiss_price**, the high-performance TCG intelligence engine. This guide ensures that both human developers and AI agents can achieve professional results in seconds.
 
@@ -70,6 +74,7 @@ Ensure your JSON matches this structure exactly:
   "number": "Card Number (e.g., 001/185)",
   "set_code": "Set ID (e.g., SV4)",
   "grade": "Common / PSA 10 / Raw",
+  "language": "EN / JP / Unknown (for SNKRDUNK tie-break)",
   "category": "Pokemon / One Piece / Union Arena",
   "is_alt_art": false
 }
@@ -80,7 +85,7 @@ Pass your extracted data to unoffical_renaiss_price via the CLI. This skips inte
 
 **CLI Command:**
 ```bash
-python3 openclaw_facade.py --mode full --poster_version v3 --json '{"name": "Mewtwo", "number": "150/165", "set_code": "SV1"}'
+python3 openclaw_facade.py --mode full --poster_version v3 --json '{"name": "Mewtwo", "number": "150/165", "set_code": "SV1", "grade": "PSA 10", "language": "JP"}'
 ```
 
 ---
@@ -101,7 +106,30 @@ python3 openclaw_facade.py "path/to/downloaded/image.jpg" --mode full --poster_v
 To get 100% accurate market data, agents should pay attention to these fields:
 - **`set_code`**: This is critical for PriceCharting/SNKRDUNK filters. Use codes like `SV1`, `OP01`, `EB01`.
 - **`grade`**: Use `"PSA 10"`, `"BGS 9.5"`, or `"Raw"` (default).
+- **`language`**: Use `"EN"` / `"JP"` / `"Unknown"`; this is used as SNKRDUNK final tie-break when candidates are otherwise tied.
 - **`is_alt_art`**: Set to `true` if the card is a Parallel Art or Special Illustration Rare.
+
+### 📈 PriceCharting Grade Rule (Important)
+- `step2_pc.json` is parsed/normalized data, not raw website output.
+- Parser uses strict grade mapping:
+  - `PSA 10` only from explicit PSA-10 tokens
+  - `CGC/BGS/SGC 10` are kept separate and never merged into `PSA 10`
+- This avoids false PSA10 prices caused by generic `10` tokens in listing text.
+
+### 🧬 Gemrate / PSA Data (Report + Poster)
+- FULL mode includes Gemrate population stats in report text:
+  - Total Population
+  - PSA 10 count
+  - PSA 9 count
+  - PSA 8 and below
+  - Gem Mint Rate (%)
+- v3 market poster includes PSA data cards and global market stats cards.
+- Current layout: PSA section + Global section are rendered inside one shared outer stats container.
+
+### 🧪 Debug Artifacts
+- `step2_pc_source.md`: raw PriceCharting markdown (source snapshot)
+- `step2_pc.json`: parsed PriceCharting records (with normalized grades)
+- `step2_snkr.json`, `step2_meta.json`, `step3_report.md`
 
 ---
 

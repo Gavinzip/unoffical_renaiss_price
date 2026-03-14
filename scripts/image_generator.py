@@ -52,6 +52,58 @@ def _resolve_template_bundle(template_version):
     market_tpl = os.path.join(template_dir, "ai_studio_code.html")
     return "v3", template_dir, profile_tpl, market_tpl
 
+
+def _normalize_ui_lang(lang):
+    value = str(lang or "").strip().lower().replace("_", "-")
+    if value in {"zh", "zh-tw", "zh-hant", "tw", "hant"}:
+        return "zh"
+    if value in {"zhs", "zh-cn", "zh-hans", "cn", "chs", "hans"}:
+        return "zhs"
+    if value in {"en", "en-us", "en-gb"}:
+        return "en"
+    if value in {"ko", "ko-kr", "kr"}:
+        return "ko"
+    return "zh"
+
+
+def _lt(lang, zh, en, ko, zhs=None):
+    if lang == "en":
+        return en
+    if lang == "ko":
+        return ko
+    if lang == "zhs":
+        return zhs if zhs is not None else zh
+    return zh
+
+
+def _format_days_span(lang, delta_days):
+    if delta_days == 0:
+        return _lt(lang, " (24h內)", " (24h)", " (24시간)", " (24小时内)")
+    if delta_days < 30:
+        return _lt(lang, f" (近{delta_days}天)", f" (last {delta_days} days)", f" (최근 {delta_days}일)", f" (近{delta_days}天)")
+    if delta_days <= 60:
+        return _lt(lang, " (近1個月)", " (last 1 month)", " (최근 1개월)", " (近1个月)")
+    months = round(delta_days / 30)
+    return _lt(lang, f" (近{months}個月)", f" (last {months} months)", f" (최근 {months}개월)", f" (近{months}个月)")
+
+
+def _localize_template_static(html, lang):
+    replacements = {
+        "Market Heat (熱度)": _lt(lang, "Market Heat (熱度)", "Market Heat", "Market Heat", "Market Heat (热度)"),
+        "Collection Value (價值)": _lt(lang, "Collection Value (價值)", "Collection Value", "Collection Value", "Collection Value (价值)"),
+        "Playability (競技)": _lt(lang, "Playability (競技)", "Playability", "Playability", "Playability (竞技)"),
+        "AVG (近2個月)": _lt(lang, "AVG (近2個月)", "AVG (Last 2 Months)", "AVG (최근 2개월)", "AVG (近2个月)"),
+        "Global Market Data": _lt(lang, "Global Market Data", "Global Market Data", "Global Market Data", "Global Market Data"),
+        "PriceCharting Trend": _lt(lang, "PriceCharting Trend", "PriceCharting Trend", "PriceCharting Trend", "PriceCharting Trend"),
+        "SNKRDUNK Trend": _lt(lang, "SNKRDUNK Trend", "SNKRDUNK Trend", "SNKRDUNK Trend", "SNKRDUNK Trend"),
+        "Global Aggregated Market Stats": _lt(lang, "Global Aggregated Market Stats", "Global Aggregated Market Stats", "Global Aggregated Market Stats", "Global Aggregated Market Stats"),
+    }
+    out = html
+    for src, dst in replacements.items():
+        out = out.replace(src, dst)
+    return out
+
+
 class AsyncBrowserManager:
     _instance = None
     _browser = None
@@ -238,20 +290,21 @@ async def _screenshot_poster_root(page, out_path):
 
     await page.screenshot(path=out_path, type="png", full_page=False, animations="disabled")
 
-def parse_level_and_desc(text):
+def parse_level_and_desc(text, ui_lang="zh"):
+    lang = _normalize_ui_lang(ui_lang)
     raw = "" if text is None else str(text).strip()
     unknown_markers = {"", "unknown", "n/a", "na", "none", "null", "未知", "未提供"}
     if raw.lower() in unknown_markers:
-        return "N/A", "資料不足"
+        return "N/A", _lt(lang, "資料不足", "Insufficient data", "데이터 부족", "数据不足")
 
     match = re.match(r'^\s*(high|medium|low)\b[。，,：:\s-]*(.*)$', raw, flags=re.IGNORECASE)
     if match:
         level = match.group(1).capitalize()
         desc = match.group(2).strip().lstrip('\\').lstrip(':').lstrip(' ').strip()
-        return level, (desc if desc else "資料不足")
+        return level, (desc if desc else _lt(lang, "資料不足", "Insufficient data", "데이터 부족", "数据不足"))
 
     cleaned = raw.lstrip('\\').lstrip(':').lstrip(' ').strip()
-    return "N/A", (cleaned if cleaned else "資料不足")
+    return "N/A", (cleaned if cleaned else _lt(lang, "資料不足", "Insufficient data", "데이터 부족", "数据不足"))
 
 def get_width_from_level(level):
     l = level.lower()
@@ -262,7 +315,8 @@ def get_width_from_level(level):
     if 'low' in l: return 30
     return 0
 
-def generate_features_html(features_text, theme="dark"):
+def generate_features_html(features_text, theme="dark", ui_lang="zh"):
+    lang = _normalize_ui_lang(ui_lang)
     lines = [L.strip().lstrip('•').strip() for L in str(features_text).split('\n') if L.strip()]
     icons = ['verified', 'hotel_class', 'bolt', 'star', 'diamond']
     html = ""
@@ -279,7 +333,7 @@ def generate_features_html(features_text, theme="dark"):
             title = parts[0]
             desc = parts[1]
         elif len(line) > 15:
-            title = "Special Feature"
+            title = _lt(lang, "卡片亮點", "Special Feature", "카드 포인트", "卡片亮点")
             desc = line
         else:
             title = line
@@ -302,7 +356,8 @@ def generate_features_html(features_text, theme="dark"):
 """
     return html
 
-def generate_table_rows(records, is_jpy=False, target_grade=None, theme="dark"):
+def generate_table_rows(records, is_jpy=False, target_grade=None, theme="dark", ui_lang="zh", max_rows=10):
+    lang = _normalize_ui_lang(ui_lang)
     is_light = (theme == "light")
     if is_light:
         empty_cls = "text-slate-500"
@@ -318,7 +373,8 @@ def generate_table_rows(records, is_jpy=False, target_grade=None, theme="dark"):
         price_cls = "text-primary"
 
     if not records:
-        return f'<tr><td colspan="3" class="p-3 pl-4 {empty_cls} text-center">No transactions found</td></tr>'
+        empty_text = _lt(lang, "無成交紀錄", "No transactions found", "거래 기록 없음", "无成交记录")
+        return f'<tr><td colspan="3" class="p-3 pl-4 {empty_cls} text-center">{empty_text}</td></tr>'
         
     filtered_records = []
     if target_grade:
@@ -335,7 +391,7 @@ def generate_table_rows(records, is_jpy=False, target_grade=None, theme="dark"):
         filtered_records = records
 
     html = ""
-    for r in filtered_records[:10]:
+    for r in filtered_records[:max_rows]:
         date = r['date']
         grade = r.get('grade', 'Ungraded')
         if is_jpy:
@@ -353,6 +409,94 @@ def generate_table_rows(records, is_jpy=False, target_grade=None, theme="dark"):
 </tr>
 """
     return html
+
+
+def _normalize_gemrate_stats(gemrate_stats):
+    def _to_int(v):
+        try:
+            return int(float(v or 0))
+        except Exception:
+            return 0
+
+    def _to_float(v):
+        try:
+            return float(v or 0.0)
+        except Exception:
+            return 0.0
+
+    src = gemrate_stats if isinstance(gemrate_stats, dict) else {}
+    return {
+        "total_population": _to_int(src.get("total_population", 0)),
+        "psa10_count": _to_int(src.get("psa10_count", 0)),
+        "psa9_count": _to_int(src.get("psa9_count", 0)),
+        "psa8_below_count": _to_int(src.get("psa8_below_count", 0)),
+        "gem_mint_rate": _to_float(src.get("gem_mint_rate", 0.0)),
+    }
+
+
+def generate_psa_stats_panel_html(gemrate_stats, theme="light", ui_lang="zh"):
+    lang = _normalize_ui_lang(ui_lang)
+    stats = _normalize_gemrate_stats(gemrate_stats)
+
+    title = "PSA"
+    item_total = _lt(lang, "總數量", "Total Population", "총 개체수", "总数量")
+    item_psa10 = _lt(lang, "PSA 10 / 滿分率", "PSA 10 / Gem Rate", "PSA 10 / 젬레이트", "PSA 10 / 满分率")
+    item_psa9 = _lt(lang, "PSA 9", "PSA 9", "PSA 9", "PSA 9")
+    item_psa8 = _lt(lang, "PSA 8以下", "PSA 8 and Below", "PSA 8 이하", "PSA 8以下")
+
+    value_total = f"{stats['total_population']:,}"
+    value_psa10_main = f"{stats['psa10_count']:,}"
+    value_psa10_rate = f"{stats['gem_mint_rate']:.2f}%"
+    value_psa9 = f"{stats['psa9_count']:,}"
+    value_psa8 = f"{stats['psa8_below_count']:,}"
+
+    if theme == "light":
+        title_html = f"""
+        <h3 class="text-sm font-black uppercase tracking-[0.3em] text-text-muted mb-6 flex items-center gap-3">
+            <span class="w-2 h-2 rounded-full bg-premium-gold shadow-[0_0_8px_rgba(212,175,55,0.8)] animate-pulse"></span>
+            {title}
+        </h3>"""
+        card_cls = "flex flex-col gap-1 p-5 rounded-xl bg-white/85 border border-white/90 shadow-[0_8px_20px_rgba(15,23,42,0.04)]"
+        label_cls = "text-text-muted text-xs font-bold uppercase tracking-widest"
+        value_cls = "text-4xl font-black text-text-main tracking-tight mt-1"
+        line_cls = "w-full h-1 bg-gradient-to-r from-gray-300 to-transparent mt-3 rounded-full"
+    else:
+        title_html = f"""
+        <h3 class="text-sm font-black uppercase tracking-[0.3em] text-slate-300 mb-6 flex items-center gap-3">
+            <span class="w-2 h-2 rounded-full bg-primary shadow-[0_0_8px_rgba(212,175,55,0.8)]"></span>
+            {title}
+        </h3>"""
+        card_cls = "flex flex-col gap-1 p-5 rounded-xl bg-white/10 border border-white/15"
+        label_cls = "text-slate-300 text-xs font-bold uppercase tracking-widest"
+        value_cls = "text-4xl font-black text-white tracking-tight mt-1"
+        line_cls = "w-full h-1 bg-gradient-to-r from-primary/60 to-transparent mt-3 rounded-full"
+
+    cards = [
+        (item_total, f'<div class="{value_cls}">{value_total}</div>'),
+        (
+            item_psa10,
+            f'<div class="{value_cls} leading-none flex items-end gap-1">{value_psa10_main}'
+            f'<span class="text-2xl leading-none pb-[2px]">({value_psa10_rate})</span>'
+            f'</div>',
+        ),
+        (item_psa9, f'<div class="{value_cls}">{value_psa9}</div>'),
+        (item_psa8, f'<div class="{value_cls}">{value_psa8}</div>'),
+    ]
+
+    card_html = ""
+    for label, value_html in cards:
+        card_html += f"""
+        <div class="{card_cls}">
+            <span class="{label_cls}">{label}</span>
+            {value_html}
+            <div class="{line_cls}"></div>
+        </div>"""
+
+    return f"""
+    {title_html}
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {card_html}
+    </div>"""
 
 def get_badge_html(grade):
     grade_upper = grade.upper()
@@ -471,7 +615,7 @@ def create_premium_matplotlib_chart_b64(records, color_line='#f4d125', target_gr
         x_grid_alpha = 0.1
 
     # Use a wider/taller canvas ratio to better fill the poster chart slot.
-    fig, ax1 = plt.subplots(figsize=(8.0, 3.6), facecolor='none')
+    fig, ax1 = plt.subplots(figsize=(8.2, 3.9), facecolor='none')
     ax1.set_facecolor('none')
 
     if not sorted_dates:
@@ -536,7 +680,7 @@ def create_premium_matplotlib_chart_b64(records, color_line='#f4d125', target_gr
         t.set_fontweight('bold')
 
     # Reduce outer padding while keeping axis labels readable.
-    fig.subplots_adjust(left=0.055, right=0.985, top=0.96, bottom=0.17)
+    fig.subplots_adjust(left=0.08, right=0.985, top=0.91, bottom=0.23)
     plt.margins(x=0.01)
 
     ax1.yaxis.grid(color=grid_color, linestyle=':', linewidth=1, alpha=y_grid_alpha)
@@ -556,7 +700,7 @@ def create_premium_matplotlib_chart_b64(records, color_line='#f4d125', target_gr
         lines_1 + lines_2,
         [price_label, vol_label],
         loc='upper left',
-        bbox_to_anchor=(0.01, 0.995),
+        bbox_to_anchor=(0.015, 0.985),
         prop={'size': 11},
         frameon=False,
         labelcolor=legend_color,
@@ -564,7 +708,7 @@ def create_premium_matplotlib_chart_b64(records, color_line='#f4d125', target_gr
 
     buf = io.BytesIO()
     # Preserve predictable aspect ratio for poster slots while keeping transparent bg.
-    plt.savefig(buf, format='png', transparent=True, dpi=220, pad_inches=0)
+    plt.savefig(buf, format='png', transparent=True, dpi=220, pad_inches=0.03)
     buf.seek(0)
     plt.close(fig)
     return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
@@ -572,20 +716,36 @@ def create_premium_matplotlib_chart_b64(records, color_line='#f4d125', target_gr
 def calculate_arbitrage_stats(pc_records, snkr_records):
     pc_safe = pc_records or []
     snkr_safe = snkr_records or []
-    
-    # Calculate stats for the bottom section
+
+    # Use a single conversion baseline in poster stats to keep both markets comparable.
+    jpy_to_usd = 150.0
+
+    # Calculate bottom-section stats with both markets combined.
     prices_10 = [float(r['price']) for r in pc_safe if '10' in str(r.get('grade', ''))]
     prices_raw = [float(r['price']) for r in pc_safe if 'Ungraded' in str(r.get('grade', ''))]
     prices_9 = [float(r['price']) for r in pc_safe if '9' in str(r.get('grade', ''))]
-    
+
+    prices_10.extend([
+        float(r['price']) / jpy_to_usd
+        for r in snkr_safe
+        if str(r.get('grade', '')).strip() in ['S', 'PSA10', 'PSA 10']
+    ])
+    prices_raw.extend([
+        float(r['price']) / jpy_to_usd
+        for r in snkr_safe
+        if str(r.get('grade', '')).strip() in ['A', 'Ungraded']
+    ])
+    prices_9.extend([
+        float(r['price']) / jpy_to_usd
+        for r in snkr_safe
+        if '9' in str(r.get('grade', ''))
+    ])
+
     avg_10 = sum(prices_10)/len(prices_10) if len(prices_10) > 0 else 0
     max_10 = max(prices_10) if len(prices_10) > 0 else 0
     avg_raw = sum(prices_raw)/len(prices_raw) if len(prices_raw) > 0 else 0
     avg_9 = sum(prices_9)/len(prices_9) if len(prices_9) > 0 else 0
-    
-    snkr_10 = [float(r['price']) for r in snkr_safe if r.get('grade', '') in ['S', 'PSA10', 'PSA 10']]
-    snkr_raw = [float(r['price']) for r in snkr_safe if 'A' in str(r.get('grade', ''))]
-    
+
     # Arbitrage Profit estimation for Raw -> PSA 10 (Targeting Max Price)
     # Grading fee estimated around 1100 TWD (~$35 USD) + 10% value upcharge
     profit = 0
@@ -595,9 +755,10 @@ def calculate_arbitrage_stats(pc_records, snkr_records):
         
     return avg_10, avg_9, avg_raw, profit, max_10
 
-async def generate_report(card_data, snkr_records, pc_records, out_dir=None, template_version="v3"):
+async def generate_report(card_data, snkr_records, pc_records, out_dir=None, template_version="v3", ui_lang=None):
     if not out_dir:
         out_dir = BASE_DIR
+    ui_lang = _normalize_ui_lang(ui_lang or card_data.get("ui_lang", "zh"))
 
     selected_version, template_dir, template1_path, template2_path = _resolve_template_bundle(template_version)
     print(f"🖼️ Poster template version: {selected_version} | profile={os.path.basename(template1_path)} | market={os.path.basename(template2_path)}")
@@ -633,18 +794,22 @@ async def generate_report(card_data, snkr_records, pc_records, out_dir=None, tem
         except Exception as e:
             print(f"⚠️ Logo inline failed: {e}")
 
+    html1 = _localize_template_static(html1, ui_lang)
+    html2 = _localize_template_static(html2, ui_lang)
+
     # Prefer Chinese display name, then English name, and keep Japanese as last fallback.
     name = card_data.get('c_name') or card_data.get('name') or card_data.get('jp_name') or 'Unknown Trading Card'
     safe_name = name.replace(' ', '_').replace('/', '_')
     
-    mh_level, mh_desc = parse_level_and_desc(card_data.get('market_heat', 'Medium'))
-    cv_level, cv_desc = parse_level_and_desc(card_data.get('collection_value', 'Medium'))
-    cf_level, cf_desc = parse_level_and_desc(card_data.get('competitive_freq', 'Low'))
+    mh_level, mh_desc = parse_level_and_desc(card_data.get('market_heat', 'Medium'), ui_lang=ui_lang)
+    cv_level, cv_desc = parse_level_and_desc(card_data.get('collection_value', 'Medium'), ui_lang=ui_lang)
+    cf_level, cf_desc = parse_level_and_desc(card_data.get('competitive_freq', 'Low'), ui_lang=ui_lang)
     
     card_img_b64 = get_image_base64_from_url(card_data.get('img_url', ''))
     
     p_prices = [r['price'] for r in pc_records] if pc_records else [0]
     total_entries = (len(snkr_records) if snkr_records else 0) + (len(pc_records) if pc_records else 0)
+    gemrate_stats = card_data.get("gemrate_stats") or {}
     
     avg_10, avg_9, avg_raw, profit, max_10 = calculate_arbitrage_stats(pc_records, snkr_records) if pc_records else (0,0,0,0,0)
     
@@ -710,7 +875,7 @@ async def generate_report(card_data, snkr_records, pc_records, out_dir=None, tem
         "{{ competitive_freq_level }}": cf_level,
         "{{ competitive_freq_desc }}": cf_desc,
         "{{ competitive_freq_width }}": str(get_width_from_level(cf_level)),
-        "{{ features_html }}": generate_features_html(card_data.get('features', ''), theme=profile_theme),
+        "{{ features_html }}": generate_features_html(card_data.get('features', ''), theme=profile_theme, ui_lang=ui_lang),
         "{{ illustrator }}": card_data.get('illustrator', 'Unknown'),
         "{{ release_info }}": card_data.get('release_info', 'Unknown'),
         "{{ card_image }}": card_img_b64,
@@ -729,6 +894,7 @@ async def generate_report(card_data, snkr_records, pc_records, out_dir=None, tem
 
     # --- Dynamic Charts and Stats Construction ---
     target_grade = card_data.get('grade', 'Ungraded')
+    psa_stats_panel_html = generate_psa_stats_panel_html(gemrate_stats, theme=market_theme, ui_lang=ui_lang)
 
     # Calculate time span for Total Entries
     all_dates = []
@@ -739,15 +905,7 @@ async def generate_report(card_data, snkr_records, pc_records, out_dir=None, tem
     if all_dates:
         min_date = min(all_dates)
         delta_days = (datetime.now() - min_date).days
-        if delta_days == 0:
-            days_span = " (24h內)"
-        elif delta_days < 30:
-            days_span = f" (近{delta_days}天)"
-        elif delta_days <= 60:
-            days_span = f" (近1個月)" # roughly
-        else:
-            months = round(delta_days / 30)
-            days_span = f" (近{months}個月)"
+        days_span = _format_days_span(ui_lang, delta_days)
 
     is_raw = target_grade in ['Ungraded', 'A']
 
@@ -767,38 +925,45 @@ async def generate_report(card_data, snkr_records, pc_records, out_dir=None, tem
         v_sk_10 = len([r for r in (snkr_records or []) if r.get('grade') in ['S', 'PSA10', 'PSA 10'] and parse_d(r['date']) > v_sk_10_cutoff])
         v_sk_raw = count_30_days(snkr_records, 'A')
 
+        chart_label_psa10 = _lt(ui_lang, "PSA 10 趨勢", "PSA 10 Trend", "PSA 10 추세", "PSA 10 趋势")
+        chart_label_ungraded = _lt(ui_lang, "裸卡趨勢", "Ungraded Trend", "미감정 추세", "裸卡趋势")
+        vol_pc_10 = _lt(ui_lang, f"30日量: {v_pc_10} 筆", f"30d Vol: {v_pc_10} Set", f"30일 거래량: {v_pc_10}건", f"30日量: {v_pc_10} 笔")
+        vol_pc_raw = _lt(ui_lang, f"30日量: {v_pc_raw} 筆", f"30d Vol: {v_pc_raw} Set", f"30일 거래량: {v_pc_raw}건", f"30日量: {v_pc_raw} 笔")
+        vol_sk_10 = _lt(ui_lang, f"30日量: {v_sk_10} 筆", f"30d Vol: {v_sk_10} Set", f"30일 거래량: {v_sk_10}건", f"30日量: {v_sk_10} 笔")
+        vol_sk_raw = _lt(ui_lang, f"30日量: {v_sk_raw} 筆", f"30d Vol: {v_sk_raw} Set", f"30일 거래량: {v_sk_raw}건", f"30日量: {v_sk_raw} 笔")
+
         pc_charts_html = f"""
         <div class="w-full flex flex-col gap-6 mb-2 mt-4">
-            <div class="relative glass-panel rounded-xl border border-green-500/40 p-2 h-[220px] overflow-hidden shadow-[0_0_20px_rgba(34,197,94,0.15)]">
-                <span class="absolute top-[-14px] left-4 text-[10px] font-bold text-white tracking-widest bg-black border border-green-500/50 px-3 py-1 rounded-full z-20 shadow-lg">PSA 10 Trend</span>
-                <span class="absolute top-[-14px] right-4 text-[10px] font-bold text-white bg-black/90 px-3 py-1 rounded-full border border-green-500/50 z-20 shadow-lg">30d Vol: {v_pc_10} Set</span>
-                <img src="{c_pc_10}" class="{chart_img_class_raw}" />
+            <div class="relative glass-panel rounded-xl border border-green-500/40 p-3 pt-11 h-[248px] overflow-hidden shadow-[0_0_20px_rgba(34,197,94,0.15)]">
+                <span class="absolute top-2 left-3 text-[10px] font-bold text-white tracking-widest bg-black border border-green-500/50 px-3 py-1 rounded-full z-20 shadow-lg">{chart_label_psa10}</span>
+                <span class="absolute top-2 right-3 text-[10px] font-bold text-white bg-black/90 px-3 py-1 rounded-full border border-green-500/50 z-20 shadow-lg">{vol_pc_10}</span>
+                <img src="{c_pc_10}" class="{chart_img_class_raw} rounded-[10px]" />
             </div>
-            <div class="relative glass-panel rounded-xl border border-red-500/40 p-2 h-[220px] overflow-hidden shadow-[0_0_20px_rgba(239,68,68,0.15)]">
-                <span class="absolute top-[-14px] left-4 text-[10px] font-bold text-white tracking-widest bg-black border border-red-500/50 px-3 py-1 rounded-full z-20 shadow-lg">Ungraded Trend</span>
-                <span class="absolute top-[-14px] right-4 text-[10px] font-bold text-white bg-black/90 px-3 py-1 rounded-full border border-red-500/50 z-20 shadow-lg">30d Vol: {v_pc_raw} Set</span>
-                <img src="{c_pc_raw}" class="{chart_img_class_raw}" />
+            <div class="relative glass-panel rounded-xl border border-red-500/40 p-3 pt-11 h-[248px] overflow-hidden shadow-[0_0_20px_rgba(239,68,68,0.15)]">
+                <span class="absolute top-2 left-3 text-[10px] font-bold text-white tracking-widest bg-black border border-red-500/50 px-3 py-1 rounded-full z-20 shadow-lg">{chart_label_ungraded}</span>
+                <span class="absolute top-2 right-3 text-[10px] font-bold text-white bg-black/90 px-3 py-1 rounded-full border border-red-500/50 z-20 shadow-lg">{vol_pc_raw}</span>
+                <img src="{c_pc_raw}" class="{chart_img_class_raw} rounded-[10px]" />
             </div>
         </div>"""
         
         snkr_charts_html = f"""
         <div class="w-full flex flex-col gap-6 mb-2 mt-4">
-            <div class="relative glass-panel rounded-xl border border-green-500/40 p-2 h-[220px] overflow-hidden shadow-[0_0_20px_rgba(34,197,94,0.15)]">
-                <span class="absolute top-[-14px] left-4 text-[10px] font-bold text-white tracking-widest bg-black border border-green-500/50 px-3 py-1 rounded-full z-20 shadow-lg">PSA 10 Trend</span>
-                <span class="absolute top-[-14px] right-4 text-[10px] font-bold text-white bg-black/90 px-3 py-1 rounded-full border border-green-500/50 z-20 shadow-lg">30d Vol: {v_sk_10} Set</span>
-                <img src="{c_sk_10}" class="{chart_img_class_raw}" />
+            <div class="relative glass-panel rounded-xl border border-green-500/40 p-3 pt-11 h-[248px] overflow-hidden shadow-[0_0_20px_rgba(34,197,94,0.15)]">
+                <span class="absolute top-2 left-3 text-[10px] font-bold text-white tracking-widest bg-black border border-green-500/50 px-3 py-1 rounded-full z-20 shadow-lg">{chart_label_psa10}</span>
+                <span class="absolute top-2 right-3 text-[10px] font-bold text-white bg-black/90 px-3 py-1 rounded-full border border-green-500/50 z-20 shadow-lg">{vol_sk_10}</span>
+                <img src="{c_sk_10}" class="{chart_img_class_raw} rounded-[10px]" />
             </div>
-            <div class="relative glass-panel rounded-xl border border-red-500/40 p-2 h-[220px] overflow-hidden shadow-[0_0_20px_rgba(239,68,68,0.15)]">
-                <span class="absolute top-[-14px] left-4 text-[10px] font-bold text-white tracking-widest bg-black border border-red-500/50 px-3 py-1 rounded-full z-20 shadow-lg">Ungraded Trend</span>
-                <span class="absolute top-[-14px] right-4 text-[10px] font-bold text-white bg-black/90 px-3 py-1 rounded-full border border-red-500/50 z-20 shadow-lg">30d Vol: {v_sk_raw} Set</span>
-                <img src="{c_sk_raw}" class="{chart_img_class_raw}" />
+            <div class="relative glass-panel rounded-xl border border-red-500/40 p-3 pt-11 h-[248px] overflow-hidden shadow-[0_0_20px_rgba(239,68,68,0.15)]">
+                <span class="absolute top-2 left-3 text-[10px] font-bold text-white tracking-widest bg-black border border-red-500/50 px-3 py-1 rounded-full z-20 shadow-lg">{chart_label_ungraded}</span>
+                <span class="absolute top-2 right-3 text-[10px] font-bold text-white bg-black/90 px-3 py-1 rounded-full border border-red-500/50 z-20 shadow-lg">{vol_sk_raw}</span>
+                <img src="{c_sk_raw}" class="{chart_img_class_raw} rounded-[10px]" />
             </div>
         </div>"""
 
-        stat_1_t, stat_1_v = "PSA 10 Avg (完整品)", f"${avg_10:.2f}" if avg_10 > 0 else "N/A"
-        stat_2_t, stat_2_v = "Ungraded Avg (裸卡)", f"${avg_raw:.2f}" if avg_raw > 0 else "N/A"
-        stat_3_t, stat_3_v = "PSA 10 Max (最高成交價)", f"${max_10:.2f}" if max_10 > 0 else "N/A"
-        stat_4_t, stat_4_v = f"Total Entries{days_span}", str(total_entries)
+        stat_1_t, stat_1_v = _lt(ui_lang, "PSA 10 Avg (完整品)", "PSA 10 Avg", "PSA 10 평균", "PSA 10 均价 (完整品)"), f"${avg_10:.2f}" if avg_10 > 0 else "N/A"
+        stat_2_t, stat_2_v = _lt(ui_lang, "Ungraded Avg (裸卡)", "Ungraded Avg", "미감정 평균", "Ungraded 均价 (裸卡)"), f"${avg_raw:.2f}" if avg_raw > 0 else "N/A"
+        stat_3_t, stat_3_v = _lt(ui_lang, "PSA 10 Max (最高成交價)", "PSA 10 Max", "PSA 10 최고가", "PSA 10 最高成交价"), f"${max_10:.2f}" if max_10 > 0 else "N/A"
+        stat_4_t, stat_4_v = f"{_lt(ui_lang, '總筆數', 'Total Entries', '총 건수', '总笔数')}{days_span}", str(total_entries)
         
         pc_table_html = ""
         snkr_table_html = ""
@@ -836,18 +1001,23 @@ async def generate_report(card_data, snkr_records, pc_records, out_dir=None, tem
             <img src="{c_pc}" class="{chart_img_class}" />
         </div>"""
         
+        header_date = _lt(ui_lang, "Date (日期)", "Date", "Date", "Date (日期)")
+        header_time = _lt(ui_lang, "Time (時間)", "Time", "Time", "Time (时间)")
+        header_grade = _lt(ui_lang, "Grade (狀態)", "Grade", "Grade", "Grade (状态)")
+        header_price = _lt(ui_lang, "Price (金額)", "Price", "Price", "Price (金额)")
+
         pc_table_html = f"""
                 <div class="flex-1 glass-panel rounded-xl overflow-hidden p-3 border {table_outer_border}">
                     <table class="w-full text-left border-collapse">
                         <thead>
                             <tr class="border-b {table_head_border} text-[10px] font-black uppercase tracking-widest {table_head_text}">
-                                <th class="p-3">Date (日期)</th>
-                                <th class="p-3">Grade (狀態)</th>
-                                <th class="p-3 text-right">Price (金額)</th>
+                                <th class="p-3">{header_date}</th>
+                                <th class="p-3">{header_grade}</th>
+                                <th class="p-3 text-right">{header_price}</th>
                             </tr>
                         </thead>
                         <tbody class="text-sm divide-y {table_body_divider}">
-                            {generate_table_rows(pc_records, is_jpy=False, target_grade=card_data.get('grade', ''), theme=market_theme)}
+                            {generate_table_rows(pc_records, is_jpy=False, target_grade=card_data.get('grade', ''), theme=market_theme, ui_lang=ui_lang, max_rows=6)}
                         </tbody>
                     </table>
                 </div>"""
@@ -862,24 +1032,26 @@ async def generate_report(card_data, snkr_records, pc_records, out_dir=None, tem
                     <table class="w-full text-left border-collapse">
                         <thead>
                             <tr class="border-b {table_head_border} text-[10px] font-black uppercase tracking-widest {table_head_text}">
-                                <th class="p-3">Time (時間)</th>
-                                <th class="p-3">Grade (狀態)</th>
-                                <th class="p-3 text-right">Price (金額)</th>
+                                <th class="p-3">{header_time}</th>
+                                <th class="p-3">{header_grade}</th>
+                                <th class="p-3 text-right">{header_price}</th>
                             </tr>
                         </thead>
                         <tbody class="text-sm divide-y {table_body_divider}">
-                            {generate_table_rows(snkr_target_records, is_jpy=True, theme=market_theme)}
+                            {generate_table_rows(snkr_target_records, is_jpy=True, theme=market_theme, ui_lang=ui_lang, max_rows=6)}
                         </tbody>
                     </table>
                 </div>"""
         else:
+            no_trend_text = _lt(ui_lang, "此等級無 SNKRDUNK 趨勢資料", "No SNKRDUNK trend data for this grade", "해당 등급의 SNKRDUNK 추세 데이터가 없습니다", "该等级无 SNKRDUNK 趋势数据")
+            no_txn_text = _lt(ui_lang, f"找不到 {target_grade} 的 SNKRDUNK 成交資料", f"No SNKRDUNK transactions found for {target_grade}", f"{target_grade} 등급 SNKRDUNK 거래가 없습니다", f"未找到 {target_grade} 的 SNKRDUNK 成交数据")
             snkr_charts_html = """
         <div class="w-full h-[220px] mt-2 mb-1 glass-panel rounded-xl border border-slate-300/70 flex items-center justify-center">
-            <p class="text-slate-500 text-sm font-semibold tracking-wide">No SNKRDUNK trend data for this grade</p>
+            <p class="text-slate-500 text-sm font-semibold tracking-wide">""" + no_trend_text + """</p>
         </div>"""
             snkr_table_html = f"""
                 <div class="glass-panel rounded-xl p-6 border {table_outer_border} text-center">
-                    <p class="text-slate-500 text-sm font-semibold">No SNKRDUNK transactions found for {target_grade}</p>
+                    <p class="text-slate-500 text-sm font-semibold">{no_txn_text}</p>
                 </div>"""
                 
         tgt_prices = []
@@ -889,12 +1061,15 @@ async def generate_report(card_data, snkr_records, pc_records, out_dir=None, tem
             tgt_prices.extend([float(r['price']) / 150.0 for r in snkr_target_records])
             
         avg_tgt = sum(tgt_prices)/len(tgt_prices) if tgt_prices else 0
-        stat_1_t, stat_1_v = f"{target_grade} Avg (均價)", f"${avg_tgt:.2f}" if avg_tgt > 0 else "N/A"
+        avg_suffix = _lt(ui_lang, "Avg (均價)", "Avg", "평균", "Avg (均价)")
+        min_suffix = _lt(ui_lang, "Min (最低)", "Min", "최저", "Min (最低)")
+        max_suffix = _lt(ui_lang, "Max (最高)", "Max", "최고", "Max (最高)")
+        stat_1_t, stat_1_v = f"{target_grade} {avg_suffix}", f"${avg_tgt:.2f}" if avg_tgt > 0 else "N/A"
         # SAFETY CHECK for empty sequences
-        stat_2_t, stat_2_v = f"{target_grade} Min (最低)", f"${min(tgt_prices):.2f}" if tgt_prices else "N/A"
-        stat_3_t, stat_3_v = f"{target_grade} Max (最高)", f"${max(tgt_prices):.2f}" if tgt_prices else "N/A"
+        stat_2_t, stat_2_v = f"{target_grade} {min_suffix}", f"${min(tgt_prices):.2f}" if tgt_prices else "N/A"
+        stat_3_t, stat_3_v = f"{target_grade} {max_suffix}", f"${max(tgt_prices):.2f}" if tgt_prices else "N/A"
         
-        stat_4_t, stat_4_v = f"Total Entries{days_span}", str(total_entries)
+        stat_4_t, stat_4_v = f"{_lt(ui_lang, '總筆數', 'Total Entries', '총 건수', '总笔数')}{days_span}", str(total_entries)
 
     replacements_2 = {
         "{{ card_name }}": name,
@@ -911,7 +1086,8 @@ async def generate_report(card_data, snkr_records, pc_records, out_dir=None, tem
         "{{ pc_charts_html }}": pc_charts_html,
         "{{ pc_table_html }}": pc_table_html,
         "{{ snkr_charts_html }}": snkr_charts_html,
-        "{{ snkr_table_html }}": snkr_table_html
+        "{{ snkr_table_html }}": snkr_table_html,
+        "{{ psa_stats_panel_html }}": psa_stats_panel_html,
     }
     
     for k, v in replacements_2.items():
