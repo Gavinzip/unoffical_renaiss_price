@@ -1,6 +1,13 @@
 # unoffical_renaiss_price Skill 🐾
 
-**Version: v1.2**
+**Version: v1.3**
+
+**v1.3 更新重點**
+- 已同步 `tcg_pro` 核心能力：`bot.py`、`market_report_vision.py`、`image_generator.py`、`templates/`、`fonts/`
+- 新增 Discord Bot 執行模式（斜線指令與討論串流程）
+- 新增 `/profile` 錢包收藏海報互動流程（語言選擇 + 模板 + SBT/Card 選擇）
+- Wallet 海報模板已納入 `templates/profile/wallet_profile.html`（目前正式模板選項為 Top 1 / Top 3 / Top 10）
+- 新增 `jinja2` 依賴（wallet profile 模板渲染需要）
 
 **v1.2 更新重點**
 - 新增 Google Gemini 視覺辨識支援 (`GOOGLE_API_KEY`)
@@ -31,6 +38,9 @@ MINIMAX_API_KEY=your_minimax_key_here
 
 # Used for fallback recognition and report formatting
 OPENAI_API_KEY=your_openai_key_here
+
+# Required when running Discord bot mode
+DISCORD_BOT_TOKEN=your_discord_bot_token_here
 ```
 > [!IMPORTANT]
 > **Native Mode**: If these keys are missing, unoffical_renaiss_price enters "Native Mode," performing basic identification using only file metadata.
@@ -48,6 +58,14 @@ OPENAI_API_KEY=your_openai_key_here
 > - Use **Flow A** when the agent already has card metadata (its own vision system).
 > - Use **Flow B** when the agent wants unoffical_renaiss_price to do vision with API keys.
 > Never remove one flow as a fallback for the other.
+
+### 3. Runtime Modes
+- **CLI/Facade Mode** (default for skills): use `openclaw_facade.py` for JSON or image workflows.
+- **Discord Bot Mode**: run `python3 bot.py` to enable slash commands and thread-based interaction in Discord.
+
+**Discord Bot Mode Commands (current)**
+- `/manual_analyze`: image-based manual candidate selection + report/poster generation.
+- `/profile address:<0x...>`: wallet collection poster wizard in a thread (language -> template -> SBT/cards -> generate).
 
 ### 🖼️ Poster Template Versions
 - Supported versions: `v1`, `v3` (legacy alias `b3` is accepted and mapped to `v3`)
@@ -281,6 +299,9 @@ Before sending anything, verify:
 - I am not sending to parent channel.
 
 ## 📁 Directory Structure
-- `openclaw_facade.py`: The single entry point (Supports `--json` discovery).
-- `scripts/`: Internal logic and visual assets (Do not modify).
+- `openclaw_facade.py`: CLI facade entry point (supports `--json` flow and image flow).
+- `bot.py`: Discord bot entry point (slash commands + thread workflow).
+- `market_report_vision.py` / `image_generator.py`: Synced core engine at repo root.
+- `templates/` + `fonts/`: Active rendering assets for root runtime.
+- `scripts/`: Compatibility runtime path (also synced for facade imports).
 - `SKILL.md`: This guide.

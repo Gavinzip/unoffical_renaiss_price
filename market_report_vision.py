@@ -1,0 +1,3052 @@
+import argparse
+import asyncio
+import subprocess
+import re
+import requests
+import json
+import time
+import urllib.parse
+import concurrent.futures
+import os
+import base64
+import threading
+import tempfile
+import html
+import image_generator
+from collections import deque
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+import contextvars
+import traceback
+
+load_dotenv()
+
+REPORT_ONLY = False
+# Use ContextVar for thread-safe per-task debug directory
+_debug_dir_var = contextvars.ContextVar('DEBUG_DIR', default=None)
+
+def _get_debug_dir():
+    return _debug_dir_var.get()
+
+def _set_debug_dir(path):
+    _debug_dir_var.set(path)
+
+_notify_msgs_var = contextvars.ContextVar('NOTIFY_MSGS', default=None)
+
+def _push_notify(msg):
+    lst = _notify_msgs_var.get()
+    if lst is not None:
+        lst.append(msg)
+
+def get_and_clear_notify_msgs():
+    lst = _notify_msgs_var.get()
+    if lst:
+        msgs = list(lst)
+        lst.clear()
+        return msgs
+    return []
+
+def _debug_save(filename, content):
+    """Debug 輔助函數：將內容存入 DEBUG_DIR/filename（若 DEBUG_DIR 已設定）"""
+    debug_dir = _get_debug_dir()
+    if not debug_dir:
+        return
+    os.makedirs(debug_dir, exist_ok=True)
+    filepath = os.path.join(debug_dir, filename)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(content)
+    _original_print(f"  💾 [DEBUG] 存檔: {filepath}")
+
+def _debug_log(msg):
+    """Debug log 輔助函數：將訊息 append 到 DEBUG_DIR/debug_log.txt"""
+    debug_dir = _get_debug_dir()
+    if not debug_dir:
+        return
+    os.makedirs(debug_dir, exist_ok=True)
+    timestamp = time.strftime('%H:%M:%S')
+    line = f"[{timestamp}] {msg}\n"
+    _original_print(f"  📍 [DEBUG] {msg}")
+    with open(os.path.join(debug_dir, 'debug_log.txt'), 'a', encoding='utf-8') as f:
+        f.write(line)
+
+
+def _debug_save_with_dir(filename, content, debug_dir=None):
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        filepath = os.path.join(debug_dir, filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        _original_print(f"  💾 [DEBUG] 存檔: {filepath}")
+        return
+    _debug_save(filename, content)
+
+
+def _debug_log_with_dir(msg, debug_dir=None):
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        timestamp = time.strftime('%H:%M:%S')
+        line = f"[{timestamp}] {msg}\n"
+        _original_print(f"  📍 [DEBUG] {msg}")
+        with open(os.path.join(debug_dir, 'debug_log.txt'), 'a', encoding='utf-8') as f:
+            f.write(line)
+        return
+    _debug_log(msg)
+
+def _debug_step(source: str, step_num: int, query: str, url: str,
+                status: str, candidate_urls: list = None,
+                selected_url: str = None, reason: str = "",
+                extra: dict = None):
+    """
+    結構化 Debug Trace — 每次搜尋動作都記錄一筆 JSON 到 debug_trace.jsonl
+    """
+    debug_dir = _get_debug_dir()
+    if not debug_dir:
+        return
+    os.makedirs(debug_dir, exist_ok=True)
+    record = {
+        "time": time.strftime('%H:%M:%S'),
+        "source": source,
+        "step": step_num,
+        "query": query,
+        "url": url,
+        "status": status,
+        "candidate_urls": candidate_urls or [],
+        "selected_url": selected_url or "",
+        "reason": reason,
+    }
+    if extra:
+        record.update(extra)
+    # 即時 print 到 terminal
+    icon = "✅" if status == "OK" else "❌"
+    _original_print(f"  {icon} [{source} Step {step_num}] query={query!r}")
+    _original_print(f"       URL  : {url}")
+    _original_print(f"       狀態 : {status}  —  {reason}")
+    if candidate_urls:
+        _original_print(f"       候選 URLs ({len(candidate_urls)} 筆):")
+        for u in candidate_urls:
+            _original_print(f"         • {u}")
+    if selected_url:
+        _original_print(f"       選定 URL : {selected_url}")
+    # append 到 JSONL
+    with open(os.path.join(debug_dir, 'debug_trace.jsonl'), 'a', encoding='utf-8') as f:
+        f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+_original_print = print
+def print(*args, **kwargs):
+    if REPORT_ONLY and not kwargs.get('force', False):
+        return
+    if 'force' in kwargs:
+        del kwargs['force']
+    _original_print(*args, **kwargs)
+
+_jina_requests_queue = deque()
+_jina_lock = threading.Lock()
+
+def fetch_jina_markdown(target_url):
+    global _jina_requests_queue
+    
+    # Rate Limiter: 18 requests per 60 seconds (1 minute)
+    MAX_REQUESTS = 18
+    WINDOW_SIZE = 60.0
+    
+    sleep_time = 0
+    with _jina_lock:
+        now = time.time()
+        # Remove requests older than 60 seconds
+        while _jina_requests_queue and now - _jina_requests_queue[0] > WINDOW_SIZE:
+            _jina_requests_queue.popleft()
+            
+        if len(_jina_requests_queue) >= MAX_REQUESTS:
+            # Calculate sleep time required to let the oldest request expire
+            sleep_time = WINDOW_SIZE - (now - _jina_requests_queue[0])
+            
+    if sleep_time > 0:
+        print(f"⏳ Jina API rate limit approaching ({MAX_REQUESTS}/min). Pausing for {sleep_time:.1f} seconds to cool down...")
+        time.sleep(sleep_time)
+        
+    with _jina_lock:
+        now = time.time()
+        # Clean up again
+        while _jina_requests_queue and now - _jina_requests_queue[0] > WINDOW_SIZE:
+            _jina_requests_queue.popleft()
+        _jina_requests_queue.append(now)
+
+    print(f"Fetching: {target_url}...")
+    jina_url = f"https://r.jina.ai/{target_url}"
+    
+    for attempt in range(3):
+        try:
+            response = requests.get(jina_url, timeout=60)
+            if response.status_code == 429:
+                print(f"⚠️ Jina 發生 429 頻率限制 (嘗試 {attempt+1}/3). 暫停 1 秒後重試...")
+                time.sleep(1)
+                continue
+                
+            response.raise_for_status()
+            return response.text
+            
+        except requests.exceptions.RequestException as e:
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 429:
+                print(f"⚠️ Jina 發生 429 頻率限制 (嘗試 {attempt+1}/3). 暫停 1 秒後重試...")
+                time.sleep(1)
+                continue
+                
+            print(f"Fetch error for {target_url}: {e}")
+            return ""
+            
+    return ""
+
+
+YUYUTEI_BOX_SOURCE_DEFAULTS = {
+    "pokemon": "https://yuyu-tei.jp/buy/poc/s/search?search_word={series_code}",
+    "one_piece": "https://yuyu-tei.jp/sell/opc/s/search?search_word={series_code}",
+    "yugioh": "https://yuyu-tei.jp/buy/ygo/s/search?search_word={series_code}",
+}
+
+
+def _normalize_box_category(raw_category):
+    text = str(raw_category or "").strip().lower()
+    if any(k in text for k in ("one piece", "航海王", "opc", "ワンピース")):
+        return "one_piece"
+    if any(k in text for k in ("yu-gi-oh", "yugioh", "遊戲王", "ygo")):
+        return "yugioh"
+    return "pokemon"
+
+
+def _find_cardlist_path():
+    env_path = (os.getenv("CARDLIST_PATH") or "").strip()
+    if env_path and os.path.isfile(env_path):
+        return env_path
+
+    cur = os.path.abspath(os.getcwd())
+    for _ in range(6):
+        candidate = os.path.join(cur, "cardlist")
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def _load_yuyutei_series_sources():
+    sources = dict(YUYUTEI_BOX_SOURCE_DEFAULTS)
+    cardlist_path = _find_cardlist_path()
+    if not cardlist_path:
+        return sources
+
+    try:
+        with open(cardlist_path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line.startswith("http"):
+                    continue
+                # Allow inline labels like: "https://... (航海王)"
+                url_only = re.split(r"\s+", line, maxsplit=1)[0]
+                category_key = _normalize_box_category(line)
+                templ = url_only
+                if "search_word=" in templ:
+                    templ = re.sub(
+                        r"(search_word=)[^&#\s]*",
+                        lambda m: f"{m.group(1)}{{series_code}}",
+                        templ,
+                        flags=re.I,
+                    )
+                elif "{series_code}" not in templ:
+                    sep = "&" if "?" in templ else "?"
+                    templ = f"{templ}{sep}search_word={{series_code}}"
+                sources[category_key] = templ
+    except Exception as e:
+        _debug_log(f"讀取 cardlist 失敗，改用預設來源: {e}")
+    return sources
+
+
+def _extract_series_code(card_info):
+    series_code = str(
+        card_info.get("series_code")
+        or card_info.get("set_code")
+        or ""
+    ).strip()
+    if series_code:
+        series_code = series_code.strip("[](){} ").replace(" ", "")
+        return series_code
+
+    number_text = str(card_info.get("number", "") or "").strip()
+    m = re.match(r"([A-Za-z]{1,6}\d{1,4})-\d{1,4}", number_text)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _looks_like_series_box(card_info):
+    item_type = str(card_info.get("item_type", "") or card_info.get("product_type", "")).strip().lower()
+    if item_type in {"series_box", "booster_box", "box", "pack_box"}:
+        return True
+
+    blob = " ".join(
+        str(card_info.get(k, "") or "")
+        for k in ("name", "jp_name", "c_name", "features", "release_info")
+    ).lower()
+    box_keywords = [
+        "卡盒", "卡包盒", "盒裝", "盒", "booster box", "box",
+        "拡張パック", "ハイクラスパック", "ブースターボックス",
+        "collection box", "premium collection", "スターター",
+    ]
+    if any(k in blob for k in box_keywords):
+        return True
+    return False
+
+
+def _sanitize_price_to_int(price_text):
+    only_digits = re.sub(r"[^0-9]", "", str(price_text or ""))
+    if not only_digits:
+        return 0
+    try:
+        return int(only_digits)
+    except Exception:
+        return 0
+
+
+def _extract_card_no(text):
+    raw = str(text or "")
+    patterns = [
+        r"([A-Z]{1,8}-JP\d{3})",
+        r"([A-Z]{1,8}\d{1,4}-\d{1,4})",
+        r"(\d{1,4}/\d{1,4})",
+        r"([A-Za-z]{1,5}\d{1,4}[a-z]?-[a-z]?\d{1,4})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, raw, re.I)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _clean_text(raw):
+    text = html.unescape(str(raw or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _parse_yuyutei_cards_from_html(raw_html, limit=400):
+    if not raw_html:
+        return []
+
+    href_pattern = re.compile(r'href="(https://yuyu-tei\.jp/(?:buy|sell)/[a-z0-9]+/card/[^"]+)"', re.I)
+    matches = list(href_pattern.finditer(raw_html))
+    seen = set()
+    items = []
+
+    for m in matches:
+        detail_url = m.group(1)
+        if detail_url in seen:
+            continue
+        seen.add(detail_url)
+
+        chunk = raw_html[m.start():m.start() + 2400]
+        img_m = re.search(r'src="(https://card\.yuyu-tei\.jp/[^"]+)"', chunk, re.I)
+        alt_m = re.search(r'alt="([^"]*)"', chunk, re.I)
+        title_m = re.search(r"<h4[^>]*>([^<]+)</h4>", chunk, re.I)
+        price_m = re.search(r"([0-9][0-9,]{0,12})\s*円", chunk)
+        if not price_m:
+            continue
+
+        alt_text = _clean_text(alt_m.group(1) if alt_m else "")
+        title_text = _clean_text(title_m.group(1) if title_m else "") or alt_text or "Unknown"
+        card_no = _extract_card_no(alt_text) or _extract_card_no(title_text)
+        price_text = f"{price_m.group(1)} 円"
+        items.append({
+            "name": title_text,
+            "card_no": card_no,
+            "price_jpy": _sanitize_price_to_int(price_m.group(1)),
+            "price_text": price_text,
+            "image_url": img_m.group(1) if img_m else "",
+            "detail_url": detail_url,
+        })
+        if len(items) >= limit:
+            break
+
+    return items
+
+
+def _parse_yuyutei_cards_from_markdown(md_text, limit=400):
+    if not md_text:
+        return []
+
+    # Expected line style from r.jina.ai:
+    # [![Image N: ...](IMG_URL) TITLE](DETAIL_URL)****9,980 円****[詳細を見る](...)
+    row_re = re.compile(
+        r"\[!\[Image\s+\d+:\s*(?P<alt>.*?)\]\((?P<img>https://card\.yuyu-tei\.jp/[^\)]+)\)\s*(?P<title>[^\]]*)\]\((?P<detail>https://yuyu-tei\.jp/(?:buy|sell)/[a-z0-9]+/card/[^\)]+)\)\*{2,}\s*(?P<price>[0-9,]+)\s*円",
+        re.I | re.S,
+    )
+    seen = set()
+    items = []
+    for m in row_re.finditer(md_text):
+        detail_url = _clean_text(m.group("detail"))
+        if detail_url in seen:
+            continue
+        seen.add(detail_url)
+        alt_text = _clean_text(m.group("alt"))
+        title_text = _clean_text(m.group("title")) or alt_text or "Unknown"
+        price_raw = _clean_text(m.group("price"))
+        items.append({
+            "name": title_text,
+            "card_no": _extract_card_no(alt_text) or _extract_card_no(title_text),
+            "price_jpy": _sanitize_price_to_int(price_raw),
+            "price_text": f"{price_raw} 円",
+            "image_url": _clean_text(m.group("img")),
+            "detail_url": detail_url,
+        })
+        if len(items) >= limit:
+            break
+    return items
+
+
+def fetch_yuyutei_series_cards(card_info, series_code):
+    category_key = _normalize_box_category(card_info.get("category", "pokemon"))
+    sources = _load_yuyutei_series_sources()
+    template = sources.get(category_key) or YUYUTEI_BOX_SOURCE_DEFAULTS.get(category_key)
+    if not template:
+        return {
+            "ok": False,
+            "error": f"找不到類別 {category_key} 的來源網址模板",
+            "items": [],
+            "source_url": "",
+            "method": "",
+            "fallback_used": False,
+        }
+
+    encoded_code = urllib.parse.quote_plus(str(series_code or "").strip())
+    if "{series_code}" in template:
+        source_url = template.format(series_code=encoded_code)
+    else:
+        sep = "&" if "?" in template else "?"
+        source_url = f"{template}{sep}search_word={encoded_code}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    }
+
+    raw_html = ""
+    method = ""
+    fallback_used = False
+    items = []
+    err_msg = ""
+
+    try:
+        resp = requests.get(source_url, headers=headers, timeout=25)
+        if resp.status_code == 200 and ("card.yuyu-tei.jp" in resp.text and "円" in resp.text):
+            raw_html = resp.text
+            items = _parse_yuyutei_cards_from_html(raw_html)
+            method = "direct_html"
+        else:
+            err_msg = f"HTTP={resp.status_code}"
+    except Exception as e:
+        err_msg = str(e)
+
+    if not items:
+        fallback_used = True
+        jina_text = fetch_jina_markdown(source_url)
+        items = _parse_yuyutei_cards_from_markdown(jina_text) or _parse_yuyutei_cards_from_html(jina_text)
+        method = "jina_markdown" if items else "jina_failed"
+
+    if items:
+        series_l = str(series_code or "").strip().lower()
+        if series_l:
+            narrowed = []
+            for item in items:
+                detail_l = str(item.get("detail_url", "")).lower()
+                card_no_l = str(item.get("card_no", "")).lower()
+                if detail_l:
+                    if f"/card/{series_l}/" in detail_l:
+                        narrowed.append(item)
+                elif card_no_l.startswith(series_l):
+                    narrowed.append(item)
+            if narrowed:
+                items = narrowed
+        items.sort(key=lambda x: x.get("price_jpy", 0), reverse=True)
+        return {
+            "ok": True,
+            "error": "",
+            "items": items,
+            "source_url": source_url,
+            "method": method,
+            "fallback_used": fallback_used,
+            "category_key": category_key,
+            "series_code": series_code,
+        }
+
+    return {
+        "ok": False,
+        "error": err_msg or "無法解析卡片列表",
+        "items": [],
+        "source_url": source_url,
+        "method": method,
+        "fallback_used": fallback_used,
+        "category_key": category_key,
+        "series_code": series_code,
+    }
+
+
+def build_series_box_report(card_info, series_result, max_lines=120):
+    series_code = series_result.get("series_code", "") or _extract_series_code(card_info)
+    box_label = (series_code or "Unknown").upper()
+    category = card_info.get("category", "Pokemon")
+    category_display_map = {
+        "pokemon": "寶可夢",
+        "one piece": "航海王",
+        "yu-gi-oh": "遊戲王",
+        "yugioh": "遊戲王",
+    }
+    category_display = category_display_map.get(str(category).strip().lower(), str(category))
+
+    lines = []
+    lines.append("# BOX SERIES REPORT")
+    lines.append("")
+    lines.append(f"📦 系列卡盒：{box_label}")
+    lines.append(f"🏷️ 類別：{category_display}")
+
+    src_url = series_result.get("source_url", "")
+    if src_url:
+        lines.append(f"🔗 資料來源：[YUYU-TEI 搜尋頁]({src_url})")
+    lines.append("---")
+
+    if not series_result.get("ok"):
+        lines.append("❌ 無法抓到系列卡片資料。")
+        if series_result.get("error"):
+            lines.append(f"原因：{series_result.get('error')}")
+        return "\n".join(lines)
+
+    items = series_result.get("items", [])
+    if items:
+        lines.append("🖼️ 卡片明細請查看海報（Top 10 Prize List）。")
+    else:
+        lines.append("⚠️ 未取得卡片明細，請稍後重試。")
+
+    return "\n".join(lines)
+
+# v1.1 變更註解:
+# 1) SNKRDUNK 搜尋從 Jina HTML 解析改為原生 API (/en/v1/search)。
+# 2) 成交歷史從 sales-histories 頁面解析改為原生 API (/en/v1/streetwears/{id}/trading-histories)。
+# 3) 新增 session warmup + retry，降低 terminal 直接呼叫 API 時的 403 機率。
+# 4) 維持既有搜尋決策流程: 先候選搜尋 -> 編號/Variant/語言過濾 -> 再抓價格。
+# 5) SNKRDUNK API 價格來源為 USD 時，先轉回 JPY，維持舊報表顯示格式。
+def _create_snkr_api_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://snkrdunk.com/",
+        "Origin": "https://snkrdunk.com",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    })
+    # Warm up cookies to reduce 403 on direct API endpoints.
+    try:
+        session.get("https://snkrdunk.com/", timeout=20)
+    except Exception as e:
+        _debug_log(f"SNKRDUNK API warmup failed (will continue): {e}")
+    return session
+
+def _snkr_api_get_json(session, url, retries=3):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            resp = session.get(url, timeout=20)
+            if resp.status_code == 403:
+                # Re-warm homepage cookies and retry.
+                session.get("https://snkrdunk.com/", timeout=20)
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_error = e
+            time.sleep(0.5 * (attempt + 1))
+    _debug_log(f"SNKRDUNK API request failed after retries: {url} | err={last_error}")
+    return {}
+
+def _snkr_history_to_jpy(history, jpy_rate):
+    price = history.get("price", 0)
+    price_fmt = str(history.get("priceFormat", ""))
+    try:
+        p = float(price)
+    except Exception:
+        return 0
+
+    if p <= 0:
+        return 0
+
+    fmt_upper = price_fmt.upper()
+    if "¥" in price_fmt or "JPY" in fmt_upper:
+        return int(round(p))
+    if "$" in price_fmt or "USD" in fmt_upper:
+        return int(round(p * jpy_rate))
+
+    # Fallback heuristic when currency symbol is missing.
+    if p >= 1000:
+        return int(round(p))
+    return int(round(p * jpy_rate))
+
+def _snkr_traded_date(traded_at):
+    if not traded_at:
+        return ""
+    if "T" in traded_at:
+        traded_at = traded_at.split("T", 1)[0]
+    return traded_at.replace("-", "/")
+
+def get_exchange_rate():
+    try:
+        resp = requests.get("https://open.er-api.com/v6/latest/USD")
+        data = resp.json()
+        return data['rates']['JPY']
+    except:
+        return 150.0
+
+def _to_int_safe(value, default=0):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        txt = str(value).strip().replace(",", "")
+        if not txt:
+            return default
+        return int(float(txt))
+    except Exception:
+        return default
+
+def _extract_year_safe(text):
+    match = re.search(r'(19|20)\d{2}', str(text or ""))
+    return match.group(0) if match else ""
+
+def _normalize_gemrate_language(raw_value, release_info=""):
+    value = str(raw_value or "").strip().lower()
+    if value in {"jp", "ja", "jpn", "japanese", "日文", "日語", "日本語", "日版"}:
+        return "Japanese"
+    if value in {"en", "eng", "english", "英文", "英語", "英語版", "usa", "us"}:
+        return "English"
+    if value in {"kr", "ko", "kor", "korean", "韓文", "韓語"}:
+        return "Korean"
+    if value in {"tc", "zh-tw", "zh-hant", "traditional chinese", "繁中", "繁體中文"}:
+        return "Traditional Chinese"
+    if value in {"sc", "zh-cn", "zh-hans", "simplified chinese", "簡中", "简体中文"}:
+        return "Simplified Chinese"
+
+    release_text = str(release_info or "")
+    release_lower = release_text.lower()
+    if "japanese" in release_lower or "日文" in release_text or "日語" in release_text:
+        return "Japanese"
+    if "english" in release_lower or "英文" in release_text:
+        return "English"
+    if "korean" in release_lower or "韓文" in release_text:
+        return "Korean"
+    return ""
+
+
+def _extract_release_hint(text):
+    src = str(text or "").strip()
+    if not src:
+        return ""
+    src = re.sub(r"^\s*(19|20)\d{2}\s*[-–—]\s*", "", src).strip()
+    src = src.replace("_", " ").replace("/", " ").replace("|", " ")
+    src = re.sub(r"\s+", " ", src).strip()
+    return src
+
+
+def _derive_gemrate_rarity_hint(features_text):
+    text = str(features_text or "").lower()
+    if any(k in text for k in ["special art rare", "sar", "特殊藝術"]):
+        return "Special Art Rare"
+    if any(k in text for k in ["illustration rare", "ir", "插畫罕貴", "插画罕贵"]):
+        return "Illustration Rare"
+    if any(k in text for k in ["art rare", " ar ", "(ar)", "（ar）", "藝術罕貴", "艺术罕贵"]):
+        return "Art Rare"
+    return ""
+
+
+def _has_missing_texture_hint(card_info):
+    blob = " ".join(
+        str(card_info.get(k, "") or "")
+        for k in ("name", "jp_name", "c_name", "features", "release_info", "set_name")
+    ).lower()
+    markers = [
+        "missing texture",
+        "missing-texture",
+        "ミッシングテクスチャ",
+        "缺紋理",
+        "缺纹理",
+        "紋理缺失",
+        "纹理缺失",
+    ]
+    return any(m in blob for m in markers)
+
+
+def _build_gemrate_queries(card_info):
+    primary_name = ""
+    for key in ("name", "c_name", "jp_name"):
+        raw = str(card_info.get(key, "") or "").strip()
+        raw = re.sub(r"\(.*?\)", "", raw).replace("-", " ").strip()
+        if raw:
+            primary_name = raw
+            break
+    names = [primary_name] if primary_name else []
+
+    number_raw = str(card_info.get("number", "") or "").strip().lstrip("#")
+    # Gemrate policy: keep the numerator token as-is (do not zfill / do not strip prefixes like GG)
+    number_token = number_raw.split("/", 1)[0].strip() if number_raw else ""
+    if not number_token:
+        number_token = number_raw
+    set_code = str(card_info.get("set_code", "") or "").strip()
+    set_code_query = set_code.replace("-", " ").strip()
+    release_info = str(card_info.get("release_info", "") or "").strip()
+    year = _extract_year_safe(release_info)
+    category = str(card_info.get("category", "Pokemon") or "Pokemon").strip()
+    raw_language = str(card_info.get("language", "") or card_info.get("card_language", "") or "").strip()
+    language = _normalize_gemrate_language(raw_language, release_info)
+
+    category_token = "Pokemon" if category.lower() == "pokemon" else category
+
+    prefix_tokens = [tok for tok in (year, category_token, language) if tok]
+    queries = []
+
+    def _push_unique(query):
+        q = re.sub(r"\s+", " ", str(query or "")).strip()
+        if q and q not in queries:
+            queries.append(q)
+
+    for nm in names:
+        # Gemrate query policy (strict): only two patterns
+        # 1) year+category+language + name+set_code+number
+        # 2) year+category+language + name+number
+        include_set_code = bool(set_code_query)
+        if include_set_code and number_token:
+            include_set_code = not number_token.lower().startswith(set_code_query.lower())
+        q1_parts = [nm]
+        if include_set_code:
+            q1_parts.append(set_code_query)
+        if number_token:
+            q1_parts.append(number_token)
+        q1_core = " ".join(x for x in q1_parts if x)
+        q2_core = " ".join(x for x in [nm, number_token] if x)
+        q1 = " ".join(prefix_tokens + [q1_core]) if prefix_tokens else q1_core
+        q2 = " ".join(prefix_tokens + [q2_core]) if prefix_tokens else q2_core
+        _push_unique(q1)
+        _push_unique(q2)
+
+    if not queries and names:
+        # Last-resort fallback when year/language/set_code are unavailable.
+        for nm in names:
+            _push_unique(" ".join(x for x in [nm, number_token] if x))
+    return queries
+
+
+def _gemrate_candidate_label(candidate):
+    if not isinstance(candidate, dict):
+        return ""
+    for key in ("title", "name", "display_name", "card_name", "label", "item_name", "product_name", "search_result_name", "description"):
+        txt = str(candidate.get(key, "") or "").strip()
+        if txt:
+            return txt
+    set_name = str(candidate.get("set_name", "") or "").strip()
+    card_num = str(candidate.get("number", "") or candidate.get("card_number", "") or "").strip()
+    name = str(candidate.get("name", "") or "").strip()
+    combo = " ".join(x for x in [name, set_name, card_num] if x).strip()
+    return combo
+
+
+def _gemrate_candidate_has_required_number(candidate, card_info):
+    label = _gemrate_candidate_label(candidate)
+    desc = str(candidate.get("description", "") or label or "").lower()
+    desc_norm = re.sub(r"\s+", " ", desc).strip()
+
+    number_raw = str(card_info.get("number", "") or "").strip().lstrip("#")
+    number_num = number_raw.split("/", 1)[0].strip() if number_raw else ""
+    number_num_l = number_num.lower()
+    if not number_num_l:
+        return False
+    # Alphanumeric identifiers (e.g. GG36) should be matched as-is, case-insensitive.
+    if re.match(r"^[a-z]+\d+$", number_num_l):
+        return re.search(rf"(?<![a-z0-9]){re.escape(number_num_l)}(?![a-z0-9])", desc_norm) is not None
+    # Pure numeric identifiers keep tolerant leading-zero matching.
+    if re.match(r"^\d+$", number_num_l):
+        num_i = int(number_num_l)
+        return re.search(rf"(?<!\d)0*{num_i}(?!\d)", desc_norm) is not None
+    return number_num_l in desc_norm
+
+
+def _score_gemrate_candidate(candidate, card_info):
+    desc = str(candidate.get("description", "") or _gemrate_candidate_label(candidate) or "").lower()
+    desc_norm = re.sub(r"\s+", " ", desc).strip()
+    score = 0
+    reasons = []
+
+    release_info = str(card_info.get("release_info", "") or "")
+    raw_language = str(card_info.get("language", "") or card_info.get("card_language", "") or "").strip()
+    preferred_lang = _normalize_gemrate_language(raw_language, release_info)
+    if preferred_lang:
+        if preferred_lang.lower() in desc_norm:
+            score += 220
+            reasons.append(f"language={preferred_lang}")
+        else:
+            reasons.append(f"language_miss={preferred_lang}")
+
+    if preferred_lang == "Japanese":
+        for token in ["korean", "indonesian", "thai", "traditional chinese", "simplified chinese", "english"]:
+            if token in desc_norm:
+                score -= 120
+                reasons.append(f"penalty_{token}")
+                break
+    elif preferred_lang == "Korean":
+        for token in ["japanese", "indonesian", "thai", "traditional chinese", "english"]:
+            if token in desc_norm:
+                score -= 120
+                reasons.append(f"penalty_{token}")
+                break
+    elif preferred_lang == "English":
+        for token in ["japanese", "korean", "indonesian", "thai", "traditional chinese"]:
+            if token in desc_norm:
+                score -= 120
+                reasons.append(f"penalty_{token}")
+                break
+
+    set_code = str(card_info.get("set_code", "") or "").lower()
+    if set_code and set_code in desc_norm:
+        score += 90
+        reasons.append("set_code")
+
+    number_raw = str(card_info.get("number", "") or "").strip().lstrip("#")
+    number_num = number_raw.split("/", 1)[0].strip() if number_raw else ""
+    number_num_l = number_num.lower()
+    number_den = number_raw.split("/", 1)[1].strip() if "/" in number_raw else ""
+    if number_num_l:
+        if re.match(r"^\d+$", number_num_l):
+            num_i = int(number_num_l)
+            if re.search(rf"(?<!\d)0*{num_i}(?!\d)", desc_norm):
+                score += 80
+                reasons.append("number_numerator")
+        elif re.match(r"^[a-z]+\d+$", number_num_l):
+            if re.search(rf"(?<![a-z0-9]){re.escape(number_num_l)}(?![a-z0-9])", desc_norm):
+                score += 80
+                reasons.append("number_numerator_alnum")
+        elif number_num_l in desc_norm:
+            score += 60
+            reasons.append("number_numerator_text")
+    if number_den and f"{number_num_l}/{number_den.lower()}" in desc_norm:
+        score += 35
+        reasons.append("number_fraction")
+
+    name_candidates = []
+    for key in ("name", "jp_name", "c_name"):
+        txt = str(card_info.get(key, "") or "").strip().lower()
+        if txt and txt not in name_candidates:
+            name_candidates.append(txt)
+    generic_name_tokens = {
+        "gx", "ex", "v", "vmax", "vstar", "tag team", "tagteam",
+        "ar", "sar", "sr", "ur", "hr", "chr", "csr", "alt art",
+    }
+    for nm in name_candidates:
+        nm_norm = re.sub(r"[^a-z0-9]+", " ", nm).strip()
+        if nm_norm and nm_norm in generic_name_tokens:
+            continue
+        if nm_norm and nm_norm in desc_norm:
+            score += 70
+            reasons.append(f"name={nm_norm}")
+            break
+        if nm and nm in desc_norm:
+            score += 60
+            reasons.append(f"name_raw={nm}")
+            break
+
+    rarity_hint = _derive_gemrate_rarity_hint(card_info.get("features", ""))
+    if rarity_hint and rarity_hint.lower() in desc_norm:
+        score += 30
+        reasons.append(f"rarity={rarity_hint}")
+
+    wants_missing_texture = _has_missing_texture_hint(card_info)
+    is_missing_texture_candidate = ("missing texture" in desc_norm) or ("missing" in desc_norm and "texture" in desc_norm)
+    if is_missing_texture_candidate and not wants_missing_texture:
+        score -= 140
+        reasons.append("penalty_missing_texture_unrequested")
+    elif is_missing_texture_candidate and wants_missing_texture:
+        score += 90
+        reasons.append("missing_texture_expected")
+    elif wants_missing_texture:
+        score -= 60
+        reasons.append("penalty_missing_texture_expected_but_absent")
+
+    release_hint = _extract_release_hint(release_info).lower()
+    if release_hint:
+        release_tokens = [t for t in re.findall(r"[a-z0-9]+", release_hint) if len(t) >= 2]
+        matched = 0
+        for tok in release_tokens[:4]:
+            if tok in {"pokemon", "card"}:
+                continue
+            if tok in desc_norm:
+                matched += 1
+        if matched:
+            add = matched * 15
+            score += add
+            reasons.append(f"release_tokens={matched}")
+
+    return score, reasons
+
+def _parse_gemrate_psa_stats(detail_data, candidate):
+    population_data = detail_data.get("population_data")
+    psa_entry = None
+    if isinstance(population_data, list):
+        for row in population_data:
+            grader = str(row.get("grader", "")).strip().upper()
+            if grader == "PSA":
+                psa_entry = row
+                break
+
+    if not psa_entry:
+        return None
+
+    grades = psa_entry.get("grades") if isinstance(psa_entry.get("grades"), dict) else {}
+    psa10 = _to_int_safe(grades.get("g10"))
+    psa9 = _to_int_safe(grades.get("g9"))
+    psa8_below = sum(_to_int_safe(grades.get(f"g{i}")) for i in range(1, 9))
+    auth_cnt = _to_int_safe(grades.get("auth"))
+
+    total = _to_int_safe(psa_entry.get("card_total_grades"))
+    if total <= 0:
+        total = psa10 + psa9 + psa8_below + auth_cnt
+    if total <= 0:
+        total = _to_int_safe(detail_data.get("total_population"))
+    if total <= 0:
+        total = _to_int_safe(candidate.get("total_population"))
+
+    gem_mint_rate = (psa10 / total * 100.0) if total > 0 else 0.0
+    gemrate_id = detail_data.get("gemrate_id") or candidate.get("gemrate_id")
+    gemrate_url = f"https://www.gemrate.com/universal-search?gemrate_id={gemrate_id}" if gemrate_id else ""
+
+    return {
+        "total_population": total,
+        "psa10_count": psa10,
+        "psa9_count": psa9,
+        "psa8_below_count": psa8_below,
+        "gem_mint_rate": round(gem_mint_rate, 2),
+        "gemrate_id": gemrate_id,
+        "gemrate_url": gemrate_url,
+    }
+
+def fetch_gemrate_psa_stats(card_info, debug_dir=None):
+    queries = _build_gemrate_queries(card_info)
+    if not queries:
+        return None
+    trace = {
+        "queries": queries[:8],
+        "attempts": [],
+        "selected": None,
+    }
+    _debug_log_with_dir(f"Gemrate: 共 {len(queries[:8])} 種查詢方案: {queries[:8]}", debug_dir)
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Origin": "https://www.gemrate.com",
+        "Referer": "https://www.gemrate.com/",
+    })
+
+    for step_idx, query in enumerate(queries[:8], start=1):
+        attempt = {
+            "step": step_idx,
+            "query": query,
+            "search_status": "",
+            "search_count": 0,
+            "candidates": [],
+            "ranked_top3": [],
+            "error": "",
+        }
+        try:
+            _debug_log_with_dir(f"Gemrate Step {step_idx}: 查詢={query!r}", debug_dir)
+            resp = session.post(
+                "https://www.gemrate.com/universal-search-query",
+                json={"query": query},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                attempt["search_status"] = f"http_{resp.status_code}"
+                trace["attempts"].append(attempt)
+                _debug_log_with_dir(f"Gemrate Step {step_idx}: API status={resp.status_code}", debug_dir)
+                continue
+            raw = resp.json()
+            results = raw if isinstance(raw, list) else raw.get("results", [])
+            if not isinstance(results, list) or not results:
+                attempt["search_status"] = "no_results"
+                trace["attempts"].append(attempt)
+                _debug_log_with_dir(f"Gemrate Step {step_idx}: 無候選結果", debug_dir)
+                continue
+            attempt["search_status"] = "ok"
+            attempt["search_count"] = len(results)
+            _debug_log_with_dir(f"Gemrate Step {step_idx}: 搜尋命中 {len(results)} 筆候選", debug_dir)
+
+            ranked = []
+            for candidate in results[:10]:
+                gemrate_id = str(candidate.get("gemrate_id", "") or "").strip()
+                cand_label = _gemrate_candidate_label(candidate)
+                if not cand_label:
+                    cand_label = f"gemrate_id={gemrate_id or 'unknown'}"
+                score, score_reasons = _score_gemrate_candidate(candidate, card_info)
+                pop_type = str(candidate.get("population_type", "") or "").strip().upper()
+                number_match = _gemrate_candidate_has_required_number(candidate, card_info)
+                cand_trace = {
+                    "gemrate_id": gemrate_id,
+                    "label": cand_label,
+                    "status": "pending",
+                    "score": score,
+                    "population_type": pop_type,
+                    "number_match": number_match,
+                    "score_reasons": score_reasons,
+                    "raw": candidate,
+                }
+                attempt["candidates"].append(cand_trace)
+                if pop_type != "UNIVERSAL":
+                    cand_trace["status"] = "skip_non_universal_population"
+                    continue
+                if not number_match:
+                    cand_trace["status"] = "skip_number_mismatch"
+                    continue
+                ranked.append((score, _to_int_safe(candidate.get("total_population", 0)), candidate, cand_trace))
+
+            if not ranked:
+                _debug_log_with_dir("Gemrate: 無可用候選（需 UNIVERSAL 且編號命中），改試下一個 query", debug_dir)
+                trace["attempts"].append(attempt)
+                continue
+
+            ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            attempt["ranked_top3"] = [
+                {
+                    "gemrate_id": str(item[2].get("gemrate_id", "") or ""),
+                    "label": item[3].get("label", ""),
+                    "score": item[0],
+                    "total_population": item[1],
+                }
+                for item in ranked[:3]
+            ]
+            _debug_log_with_dir(
+                f"Gemrate ranking top3: {[(r[3].get('label'), r[3].get('score')) for r in ranked[:3]]}",
+                debug_dir,
+            )
+
+            for score, _, candidate, cand_trace in ranked:
+                gemrate_id = str(candidate.get("gemrate_id", "") or "").strip()
+                cand_label = cand_trace.get("label", "")
+                if not gemrate_id:
+                    cand_trace["status"] = "skip_no_gemrate_id"
+                    _debug_log_with_dir(f"  ❌ Gemrate 候選缺 gemrate_id: {cand_label}", debug_dir)
+                    continue
+
+                _debug_log_with_dir(
+                    f"  🔍 Gemrate 候選: [{gemrate_id}] {cand_label} (score={score})",
+                    debug_dir,
+                )
+                page_resp = session.get(f"https://www.gemrate.com/universal-search?gemrate_id={gemrate_id}", timeout=20)
+                if page_resp.status_code != 200:
+                    cand_trace["status"] = f"skip_page_http_{page_resp.status_code}"
+                    _debug_log_with_dir(f"  ❌ Gemrate 候選頁讀取失敗: [{gemrate_id}] status={page_resp.status_code}", debug_dir)
+                    continue
+                token_match = re.search(r'(?:var|const)\s+cardDetailsToken\s*=\s*["\']([^"\']+)["\']', page_resp.text)
+                token = token_match.group(1) if token_match else ""
+                if not token:
+                    cand_trace["status"] = "skip_no_token"
+                    _debug_log_with_dir(f"  ❌ Gemrate 候選無 cardDetailsToken: [{gemrate_id}]", debug_dir)
+                    continue
+
+                detail_resp = session.get(
+                    f"https://www.gemrate.com/card-details?gemrate_id={gemrate_id}",
+                    headers={"X-Card-Details-Token": token, "Accept": "application/json"},
+                    timeout=20,
+                )
+                if detail_resp.status_code != 200:
+                    cand_trace["status"] = f"skip_detail_http_{detail_resp.status_code}"
+                    _debug_log_with_dir(f"  ❌ Gemrate card-details 失敗: [{gemrate_id}] status={detail_resp.status_code}", debug_dir)
+                    continue
+                detail_data = detail_resp.json()
+                stats = _parse_gemrate_psa_stats(detail_data, candidate)
+                if stats:
+                    stats["query"] = query
+                    cand_trace["status"] = "matched"
+                    cand_trace["stats"] = {
+                        "total_population": stats.get("total_population", 0),
+                        "psa10_count": stats.get("psa10_count", 0),
+                        "psa9_count": stats.get("psa9_count", 0),
+                        "psa8_below_count": stats.get("psa8_below_count", 0),
+                        "gem_mint_rate": stats.get("gem_mint_rate", 0.0),
+                    }
+                    trace["attempts"].append(attempt)
+                    trace["selected"] = {
+                        "step": step_idx,
+                        "query": query,
+                        "gemrate_id": gemrate_id,
+                        "label": cand_label,
+                        "score": score,
+                        "score_reasons": cand_trace.get("score_reasons", []),
+                        "stats": cand_trace["stats"],
+                    }
+                    _debug_log_with_dir(
+                        f"  ✅ Gemrate 命中: [{gemrate_id}] {cand_label} "
+                        f"(total={stats.get('total_population', 0)}, "
+                        f"psa10={stats.get('psa10_count', 0)}, "
+                        f"rate={stats.get('gem_mint_rate', 0)}%)",
+                        debug_dir,
+                    )
+                    _debug_save_with_dir("step2_gemrate.json", json.dumps(trace, ensure_ascii=False, indent=2), debug_dir)
+                    return stats
+                cand_trace["status"] = "skip_no_psa_population"
+                _debug_log_with_dir(f"  ❌ Gemrate 無 PSA population: [{gemrate_id}] {cand_label}", debug_dir)
+            trace["attempts"].append(attempt)
+        except Exception:
+            attempt["search_status"] = "error"
+            attempt["error"] = traceback.format_exc()
+            trace["attempts"].append(attempt)
+            _debug_log_with_dir(f"Gemrate Step {step_idx}: 發生例外，已跳過此查詢", debug_dir)
+            continue
+    _debug_save_with_dir("step2_gemrate.json", json.dumps(trace, ensure_ascii=False, indent=2), debug_dir)
+    return None
+
+DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+
+def _get_image_mime_type(image_path):
+    mime = "image/jpeg"
+    ext = image_path.lower().split(".")[-1]
+    if ext == "png":
+        return "image/png"
+    if ext == "webp":
+        return "image/webp"
+    return mime
+
+def _parse_vision_json(content):
+    cleaned = (content or "").replace("```json", "").replace("```", "").strip()
+    return json.loads(cleaned)
+
+def _get_llm_keys(minimax_api_hint=None):
+    google_key = (os.getenv("GOOGLE_API_KEY") or "").strip()
+    openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    minimax_key = (minimax_api_hint or os.getenv("MINIMAX_API_KEY") or "").strip()
+    return {
+        "google": google_key,
+        "openai": openai_key,
+        "minimax": minimax_key,
+    }
+
+def _get_provider_order():
+    preferred = (os.getenv("VISION_PROVIDER") or "google").strip().lower()
+    providers = ["google", "openai", "minimax"]
+    if preferred in providers:
+        return [preferred] + [p for p in providers if p != preferred]
+    return providers
+
+def _normalize_card_language(raw_value):
+    value = str(raw_value or "").strip().lower()
+    if not value:
+        return "UNKNOWN"
+    if value in ("en", "eng", "english", "英文", "英語", "英語版", "usa", "us"):
+        return "EN"
+    if value in ("jp", "ja", "jpn", "japanese", "日文", "日語", "日本語", "日版"):
+        return "JP"
+    return "UNKNOWN"
+
+def _has_pokemon_mega_feature(features_text):
+    text = str(features_text or "").lower()
+    mega_markers = [
+        "mega 進化卡面",
+        "mega進化卡面",
+        "mega evolution",
+        "mega-evolution",
+        "mega 進化",
+        "メガ進化",
+    ]
+    return any(marker in text for marker in mega_markers)
+
+def _title_has_en_marker(title):
+    title_l = str(title).lower()
+    en_markers = [
+        "[en]", "【en】", " english", "english version", "英語版", "英文版"
+    ]
+    return any(m in title_l for m in en_markers)
+
+def _fetch_pc_prices_from_url(product_url, md_content=None, skip_hi_res=False, target_grade="PSA 10"):
+    """
+    Given a PriceCharting product URL, fetch (if md_content is None) and parse it.
+    Returns (records, resolved_url, pc_img_url).
+    """
+    if not md_content:
+        md_content = fetch_jina_markdown(product_url)
+    
+    if not md_content:
+        print(f"DEBUG: Failed to get markdown for {product_url}")
+        return [], product_url, None
+
+    print(f"DEBUG: Parsing PriceCharting page: {product_url} (length: {len(md_content)})")
+    _debug_save("step2_pc_source.md", md_content)
+
+    lines = md_content.split('\n')
+    records = []
+
+    def _detect_pc_grade(text):
+        t = str(text or "").lower()
+        # Normalize tight forms like "PSA10"/"CGC9.5"
+        t = re.sub(r'(?i)\b(psa|bgs|cgc|sgc)\s*([0-9](?:\.5)?)\b', r'\1 \2', t)
+        t = re.sub(r'\s+', ' ', t).strip()
+
+        if re.search(r'\bbgs\s*9\.5\b', t):
+            return "BGS 9.5"
+        # Strict PSA 10 only: avoid mixing CGC/BGS/SGC 10 into PSA10.
+        if re.search(r'\bpsa\s*10\b', t) or ("psa" in t and re.search(r'\b(?:gem\s*mint|mint|pristine)\s*10\b', t)):
+            return "PSA 10"
+        if re.search(r'\bpsa\s*9\b', t):
+            return "PSA 9"
+        if re.search(r'\bpsa\s*8\b', t):
+            return "PSA 8"
+        if re.search(r'\bbgs\s*10\b', t):
+            return "BGS 10"
+        if re.search(r'\bcgc\s*10\b', t):
+            return "CGC 10"
+        if re.search(r'\bsgc\s*10\b', t):
+            return "SGC 10"
+        if not re.search(r'\b(psa|bgs|cgc|sgc|grade|gem|mint|pristine)\b', t):
+            return "Ungraded"
+        return None
+    
+    # Parser 1: 嘗試原本的 Markdown Table 格式 (每行有 | 分隔)
+    date_regex_md = r'\|\s*(\d{4}-\d{2}-\d{2}|[A-Z][a-z]{2}\s\d{1,2},\s\d{4})\s*\|'
+    for line in lines:
+        if re.search(date_regex_md, line):
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) >= 5:
+                date_str = parts[1]
+                all_prices = re.findall(r'\$([\d,]+\.\d{2})', line)
+                if not all_prices: continue
+                real_prices = [p for p in all_prices if p not in ('6.00',)]
+                if not real_prices: continue
+                
+                price_usd = float(real_prices[-1].replace(',', ''))
+                title_text = parts[3] if len(parts) > 3 else line
+                detected_grade = _detect_pc_grade(title_text)
+                        
+                if detected_grade:
+                    records.append({
+                        "date": date_str,
+                        "price": price_usd,
+                        "grade": detected_grade
+                    })
+
+    # Parser 2: 嘗試 Jina 新版的 TSV 格式 (日期獨立一行，標題與價格在下一行)
+    if not records: 
+        current_date = None
+        date_regex_tsv = r'^(\d{4}-\d{2}-\d.2}|[A-Z][a-z]{2}\s\d{1,2},\s\d{4})'
+        for line in lines:
+            line = line.strip()
+            date_match = re.match(date_regex_tsv, line)
+            if date_match:
+                current_date = date_match.group(1)
+                continue
+            if current_date and "$" in line:
+                all_prices = re.findall(r'\$([\d,]+\.\d{2})', line)
+                if not all_prices: continue
+                real_prices = [p for p in all_prices if p not in ('6.00',)]
+                if not real_prices: continue
+                price_usd = float(real_prices[-1].replace(',', ''))
+                detected_grade = _detect_pc_grade(line)
+                if detected_grade:
+                    records.append({
+                        "date": current_date,
+                        "price": price_usd,
+                        "grade": detected_grade
+                    })
+
+    # Summary: if no per-item records, try summary table
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    grade_summary_map = {'Ungraded': 'Ungraded', 'PSA 10': 'PSA 10', 'PSA 9': 'PSA 9', 'BGS 9.5': 'BGS 9.5'}
+    existing_grades = set(r['grade'] for r in records)
+    for line in lines:
+        for grade_label, grade_key in grade_summary_map.items():
+            label_nospace = grade_label.replace(' ', '')
+            if re.match(rf'^{re.escape(label_nospace)}\$[\d,]+\.\d{{2}}$', line.replace(' ', '')):
+                if grade_key not in existing_grades:
+                    price_match = re.search(r'\$[\d,]+\.\d{2}', line)
+                    if price_match:
+                        price_usd = extract_price(price_match.group(0))
+                        records.append({"date": today_str, "price": price_usd, "grade": grade_key, "note": "PC avg price"})
+
+    records.sort(key=lambda x: x['date'], reverse=True)
+    
+    pc_img_url = None
+    img_patterns = [
+        r'!\[.*?\]\((https://storage\.googleapis\.com/images\.pricecharting\.com/[^/)]+/\d+\.jpg)\)',
+        r'!\[.*?\]\((https://product-images\.s3\.amazonaws\.com/[^\)]+)\)',
+        r'!\[.*?\]\((https://images\.pricecharting\.com/[^\)]+)\)',
+        r'!\[.*?\]\((https://[^)]+?pricecharting\.com/[^)]+?\.(?:jpg|png|webp)[^)]*)\)',
+        r'!\[.*?\]\((https://[^)]+?\.(?:jpg|png|webp)[^)]*)\)',
+    ]
+    for pat in img_patterns:
+        m = re.search(pat, md_content)
+        if m:
+            pc_img_url = m.group(1)
+            if not skip_hi_res:
+                hiRes_url = re.sub(r'/([\d]+)\.jpg$', '/1600.jpg', pc_img_url)
+                if hiRes_url != pc_img_url:
+                    try:
+                        if requests.head(hiRes_url, timeout=5).status_code == 200:
+                            pc_img_url = hiRes_url
+                    except: pass
+            break
+
+    _debug_log(f"PriceCharting: 成功提取 {len(records)} 筆價格紀錄 (包含全等級)")
+    
+    snkr_target = target_grade.replace(" ", "")
+    matched_records = []
+    for r in records:
+        r_grade = r.get('grade', '')
+        if r_grade == target_grade: matched_records.append(r)
+        elif target_grade == "Unknown" and r_grade in ("Ungraded", "裸卡", "A"): matched_records.append(r)
+        elif r_grade == snkr_target: matched_records.append(r)
+        
+    _debug_log(f"PriceCharting: 其中符合 '{target_grade}' 的紀錄有 {len(matched_records)} 筆")
+    for r in matched_records[:5]:
+        _debug_log(f"  - [{r.get('date', '')}] {r.get('grade', '')} : ${r.get('price', 0)}")
+    if len(matched_records) > 5:
+        _debug_log(f"  ... (還有 {len(matched_records) - 5} 筆不顯示)")
+
+    return records, product_url, pc_img_url
+
+def extract_price(price_str):
+    cleaned = re.sub(r'[^\d.]', '', price_str)
+    try:
+        return float(cleaned)
+    except:
+        return 0.0
+
+
+def _normalize_alnum_dash(text):
+    return re.sub(r'[^a-z0-9]+', '-', str(text).lower()).strip('-')
+
+
+def _contains_token_boundary(text_norm, token):
+    tok = _normalize_alnum_dash(token)
+    if not tok:
+        return False
+    return re.search(rf'(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])', text_norm) is not None
+
+
+def _extract_number_denominator(number_text):
+    parts = str(number_text or "").split("/", 1)
+    if len(parts) < 2:
+        return ""
+    m = re.search(r'\d+', parts[1])
+    return m.group(0) if m else ""
+
+
+def _title_number_match(title_text, number_clean, number_padded):
+    """
+    Match card number by numerator-first logic.
+    - Prefer fraction numerator match (e.g. target 018 should match 018/072, not 010/018)
+    - Fallback to standalone number token only after removing x/y fractions
+    Returns: (matched, numerator_hit, denominator_hit, reason)
+    """
+    if not number_clean or number_clean == "0":
+        return True, "", "", "no_number_constraint"
+
+    text = str(title_text or "").lower()
+    fractions = re.findall(r'(\d{1,4})\s*/\s*(\d{1,4})', text)
+    for n_raw, d_raw in fractions:
+        n_norm = n_raw.lstrip('0') or '0'
+        d_norm = d_raw.lstrip('0') or '0'
+        if n_norm == number_clean:
+            return True, n_norm, d_norm, "fraction_numerator"
+
+    text_wo_frac = re.sub(r'\d{1,4}\s*/\s*\d{1,4}', ' ', text)
+    if number_padded and re.search(rf'(?<!\d){re.escape(number_padded)}(?!\d)', text_wo_frac):
+        return True, number_clean, "", "standalone_padded"
+    if number_clean and re.search(rf'(?<!\d){re.escape(number_clean)}(?!\d)', text_wo_frac):
+        return True, number_clean, "", "standalone_clean"
+    return False, "", "", ""
+
+
+def _score_pricecharting_candidate(
+    url,
+    *,
+    name_slug,
+    name_slug_alt,
+    number_clean,
+    number_padded,
+    number_denominator,
+    set_code_slug,
+    mega_name_hint=False,
+):
+    slug = url.split('/')[-1].lower()
+    slug_norm = _normalize_alnum_dash(slug)
+    slug_compact = re.sub(r'[^a-z0-9]', '', slug)
+    score = 0
+    reasons = []
+
+    # Priority #1: exact number is mandatory signal.
+    if number_clean and re.search(rf'(?<!\d){re.escape(number_clean)}(?!\d)', slug):
+        score += 150
+        reasons.append("number_exact")
+    elif number_padded and number_padded in slug:
+        score += 140
+        reasons.append("number_padded")
+    elif number_clean and number_clean != "0":
+        score -= 160
+        reasons.append("number_missing_penalty")
+
+    # Priority #2: set code exact (secondary to number)
+    if set_code_slug and set_code_slug in slug_compact:
+        score += 65
+        reasons.append("set_code")
+
+    # Priority #3: precise name matching (token boundary)
+    if name_slug and _contains_token_boundary(slug_norm, name_slug):
+        score += 85
+        reasons.append("name_exact")
+    elif name_slug_alt and _contains_token_boundary(slug_norm, name_slug_alt):
+        score += 70
+        reasons.append("name_alt_exact")
+    else:
+        tokens = [t for t in (name_slug or "").split('-') if t and len(t) >= 2]
+        if tokens:
+            token_hits = sum(1 for t in tokens if _contains_token_boundary(slug_norm, t))
+            if token_hits == len(tokens):
+                score += 55
+                reasons.append("name_tokens_all")
+            elif token_hits > 0:
+                score += 20
+                reasons.append("name_tokens_partial")
+
+    # Extra bonus: denominator/full-form hints to avoid same-number wrong card.
+    if number_denominator:
+        den_trim = number_denominator.lstrip('0') or number_denominator
+        if f"-{number_denominator}" in slug or f"/{number_denominator}" in slug:
+            score += 35
+            reasons.append("denominator_exact")
+        elif f"-{den_trim}" in slug or f"/{den_trim}" in slug:
+            score += 28
+            reasons.append("denominator_trim")
+
+    # Pokemon-only hint: if features says this is a Mega evolution card,
+    # candidates explicitly containing mega/m naming get a ranking boost.
+    if mega_name_hint and (
+        _contains_token_boundary(slug_norm, "mega")
+        or re.search(r'(^|-)m-(?=[a-z0-9])', slug_norm)
+    ):
+        score += 60
+        reasons.append("mega_name_hint")
+
+    return score, reasons
+
+def filter_pricecharting_candidates(candidates):
+    """Normalize and dedupe PriceCharting candidate strings."""
+    seen = set()
+    filtered = []
+    for c in candidates or []:
+        if not c:
+            continue
+        url = str(c).split(" — ", 1)[0].strip()
+        if not url.startswith("https://www.pricecharting.com/game/"):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        filtered.append(c)
+    return filtered
+
+def search_pricecharting(name, number, set_code, target_grade, is_alt_art, category="Pokemon", is_flagship=False, return_candidates=False, set_name="", jp_name="", mega_name_hint=False):
+    # Basic Name cleaning (strip parentheses and normalize hyphens to spaces)
+    name_query = re.sub(r'\(.*?\)', '', name).replace('-', ' ').strip()
+    
+    # Improve number extraction for One Piece (ST04-005 -> 005)
+    # If the number contains a dash and follows OP format, take the part after the dash
+    if '-' in number and re.search(r'[A-Z]+\d+-\d+', number):
+        number_clean = number.split('-')[-1].lstrip('0')
+    else:
+        _num_parts = number.split('/')
+        _num_raw = _num_parts[0].strip()
+        _digits_only = re.search(r'\d+', _num_raw)
+        number_clean = _digits_only.group(0).lstrip('0') if _digits_only else _num_raw.lstrip('0')
+    
+    if not number_clean: number_clean = '0'
+    
+    # Try to extract suffix like SM-P from the number itself if it's there
+    suffix = ""
+    number_denominator = _extract_number_denominator(number)
+    _num_parts = number.split('/')
+    if len(_num_parts) > 1:
+        potential_suffix = _num_parts[1].strip()
+        if re.search(r'(SM-P|S-P|SV-P|SV-G|S8a-G)', potential_suffix, re.IGNORECASE):
+            suffix = potential_suffix
+    
+    # Try with set code or suffix first
+    queries_to_try = []
+    final_set_code = set_code if set_code else suffix
+    
+    # 1. 精確搜尋 (優先)：[卡名] [Set Code] [編號]
+    if final_set_code and number_clean != '0':
+        queries_to_try.append(f"{name_query} {final_set_code} {number_clean}".replace(" ", "+"))
+
+    # 2. 廣泛搜尋：[卡名] [編號]
+    if number_clean != '0':
+        queries_to_try.append(f"{name_query} {number_clean}".replace(" ", "+"))
+
+    # 3. 系列備援：[卡名] [系列全名] [編號] (僅在沒找到時，且名稱不包含系列名時嘗試)
+    if set_name and number_clean != '0':
+        _sn_clean = set_name.lower().strip()
+        if _sn_clean not in name_query.lower():
+            queries_to_try.append(f"{name_query} {set_name} {number_clean}".replace(" ", "+"))
+
+    # 4. 基本搜尋：[卡名] [Set Code]
+    if final_set_code:
+        queries_to_try.append(f"{name_query} {final_set_code}".replace(" ", "+"))
+
+    is_one_piece = category.lower() == "one piece"
+    _debug_log(f"PriceCharting: 類別={category} ({'航海王模式' if is_one_piece else '寶可夢模式'})，共 {len(queries_to_try)} 種查詢方案: {queries_to_try}")
+
+    md_content = ""
+    search_url = ""
+    pc_step = 0
+
+    for query in queries_to_try:
+        pc_step += 1
+        search_url = f"https://www.pricecharting.com/search-products?q={query}&type=prices"
+        _debug_log(f"PriceCharting Step {pc_step}: 查詢={query!r}  URL={search_url}")
+        md_content = fetch_jina_markdown(search_url)
+        if md_content and ("Search Results" in md_content or "Your search for" in md_content):
+            _debug_step("PriceCharting", pc_step, query, search_url,
+                        "OK", reason="搜尋頁面有多筆結果，繼續解析")
+            break
+        elif md_content and "PriceCharting" in md_content:
+            _debug_step("PriceCharting", pc_step, query, search_url,
+                        "OK", reason="直接落在商品頁面")
+            break
+        else:
+            _debug_step("PriceCharting", pc_step, query, search_url,
+                        "NO_RESULTS", reason="頁面為空或無法識別，嘗試下一個查詢")
+            
+    if not md_content:
+        _debug_step("PriceCharting", pc_step, "", "",
+                    "ERROR", reason="所有查詢均無回應，放棄")
+        return None, None, None
+    
+    product_url = ""
+    if "Your search for" in md_content or "Search Results" in md_content:
+        urls = re.findall(r'(https://www\.pricecharting\.com/game/[^/]+/[^" )\]]+)', md_content)
+        # Deduplicate while preserving order
+        urls = list(dict.fromkeys(urls))
+        
+        _debug_log(f"PriceCharting: 從搜尋頁面提取到 {len(urls)} 個候選 URL")
+        
+        valid_urls = []
+        # 「名稱 slug」用純角色名（去掉括號內的版本描述，如 Leader Parallel / SP Foil 等）
+        name_for_slug = re.sub(r'\(.*?\)', '', name).strip()
+        name_slug = re.sub(r'[^a-zA-Z0-9]', '-', name_for_slug.lower()).strip('-')
+        
+        # --- Mega / M 別名處理 ---
+        name_slug_alt = ""
+        if name_slug.startswith("m-") and len(name_slug) > 2:
+            name_slug_alt = "mega-" + name_slug[2:]
+        elif name_slug.startswith("mega-") and len(name_slug) > 5:
+            name_slug_alt = "m-" + name_slug[5:]
+        
+        # 編號的 0-padded 3位形式，修復 URL slug 內 026 不能被 26 regex 匹配的問題
+        number_padded_pc = number_clean.zfill(3)
+        # 航海王模式：set_code slug 用來做額外驗證 (e.g. "OP02" -> "op02")
+        set_code_slug = re.sub(r'[^a-zA-Z0-9]', '', set_code).lower() if set_code else ""
+
+        def _num_match(slug):
+            """編號匹配：接受去前導0 或 3位補齊兩種形式"""
+            return (bool(re.search(rf'(?<!\d){number_clean}(?!\d)', slug))
+                    or number_padded_pc in slug)
+
+        def _set_match(slug):
+            """set_code 匹配：URL slug 含有 set_code 的核心字母數字部分"""
+            return bool(set_code_slug) and set_code_slug in slug.replace('-', '')
+            
+        def _name_match(slug):
+            """名稱匹配：考慮 name_slug 及其 mega/m 別名"""
+            if not name_slug:
+                return False
+            if name_slug in slug:
+                return True
+            if name_slug_alt and name_slug_alt in slug:
+                return True
+            return False
+
+        matching_both = []   # 名稱 + 編號 (+ set_code for OP)
+        matching_name = []   # 只有名稱 (+ set_code for OP)
+        matching_number = [] # 只有編號 (+ set_code for OP)
+
+        for u in urls:
+            u_end = u.split('/')[-1].lower()
+
+            if is_one_piece:
+                # ── 航海王模式：必須包含 set_code，再依名稱/編號分級 ──
+                has_set = _set_match(u_end)
+                has_num = _num_match(u_end)
+                has_name = _name_match(u_end)
+
+                if has_name and has_num and has_set:
+                    matching_both.append(u)
+                    _debug_log(f"  ✅ [OP] 名稱+編號+setcode: {u}")
+                elif has_name and has_set:
+                    matching_name.append(u)
+                    _debug_log(f"  🔶 [OP] 名稱+setcode (無編號): {u}")
+                elif has_num and has_set:
+                    matching_number.append(u)
+                    _debug_log(f"  🔷 [OP] 編號+setcode (無名稱): {u}")
+                elif has_name and has_num:
+                    matching_both.append(u)
+                    _debug_log(f"  🟡 [OP] 名稱+編號 (setcode未命中): {u}")
+                else:
+                    _debug_log(f"  ❌ [OP] URL 不符合: {u}")
+            else:
+                has_name = _name_match(u_end)
+                has_num = _num_match(u_end)
+                
+                if has_name and has_num:
+                    matching_both.append(u)
+                    _debug_log(f"  ✅ [PKM] 名稱+編號: {u}")
+                elif has_name:
+                    matching_name.append(u)
+                    _debug_log(f"  🔶 [PKM] 只符合名稱: {u}")
+                elif has_num:
+                    matching_number.append(u)
+                    _debug_log(f"  🔷 [PKM] 只符合編號 '{number_clean}'/'{number_padded_pc}': {u}")
+                else:
+                    _debug_log(f"  ❌ [PKM] URL 不符合: {u}")
+
+        # 合併：先確保至少匹配，再進入分數排序
+        valid_urls = matching_both + matching_name + matching_number
+                
+        if not valid_urls:
+            _debug_step("PriceCharting", pc_step + 1,
+                        f"name_slug={name_slug!r}, number={number_clean!r}",
+                        search_url, "NO_MATCH",
+                        candidate_urls=urls,
+                        reason=f"所有 {len(urls)} 個候選 URL 均不符合卡片名稱或編號，放棄")
+            print(f"DEBUG: No PC product URL matched the card name '{name}' or number '{number_clean}'.")
+            return None, None, None
+
+        # Score ranking: set_code > exact name > exact number > denominator hints.
+        scored_urls = []
+        for u in valid_urls:
+            sc, why = _score_pricecharting_candidate(
+                u,
+                name_slug=name_slug,
+                name_slug_alt=name_slug_alt,
+                number_clean=number_clean,
+                number_padded=number_padded_pc,
+                number_denominator=number_denominator,
+                set_code_slug=set_code_slug,
+                mega_name_hint=mega_name_hint,
+            )
+            scored_urls.append((u, sc, why))
+        scored_urls.sort(key=lambda x: x[1], reverse=True)
+        ranked_urls = [u for u, _, _ in scored_urls]
+
+        if return_candidates:
+            return ranked_urls, None, None
+
+        product_url = ranked_urls[0]
+        top_score = scored_urls[0][1]
+        top_why = ",".join(scored_urls[0][2]) if scored_urls[0][2] else "fallback"
+        selection_reason = f"Scored Best ({top_score}): {top_why}"
+        _debug_log(f"PriceCharting ranking top3: {[(u, s) for u, s, _ in scored_urls[:3]]}")
+        
+        # Filter based on is_flagship / is_alt_art (features-based override 主導)
+        if is_flagship:
+            # 旗艦賽獎品卡：尋找包含 flagship 的 URL
+            for u in ranked_urls:
+                lower_u = u.replace('[', '').replace(']', '').lower()
+                if "flagship" in lower_u:
+                    product_url = u
+                    selection_reason = "Flagship Filter (偵測到 Flagship Battle 關鍵字)"
+                    break
+        elif is_alt_art:
+            for u in ranked_urls:
+                lower_u = u.replace('[', '').replace(']', '').lower()
+                # 航海王異圖版優先尋找包含這些關鍵字的
+                if "manga" in lower_u or "alternate-art" in lower_u or "-sp" in lower_u:
+                    product_url = u
+                    selection_reason = "Alt-Art Filter (偵測到 Manga/Alternate-Art/SP 關鍵字)"
+                    break
+        
+        _debug_step("PriceCharting", pc_step + 1,
+                    f"is_alt_art={is_alt_art}, name_slug={name_slug!r}, number={number_clean!r}",
+                    search_url, "OK",
+                    candidate_urls=urls,
+                    selected_url=product_url,
+                    reason=selection_reason,
+                    extra={"matching_both": matching_both,
+                           "matching_name": matching_name,
+                           "matching_number": matching_number,
+                           "scored_top3": [(u, s) for u, s, _ in scored_urls[:3]]})
+        print(f"DEBUG: Selected PC product URL: {product_url} ({selection_reason})")
+        records, resolved_url, pc_img_url = _fetch_pc_prices_from_url(product_url, target_grade=target_grade)
+    else:
+        print(f"DEBUG: Landed directly on PC product page")
+        product_url = search_url
+        _debug_step("PriceCharting", pc_step + 1, "", product_url,
+                    "OK", reason="直接落在商品頁面，跳過 URL 篩選")
+                    
+        if return_candidates:
+            # If the main app expects candidate URLs, wrap the direct match as a candidate
+            return filter_pricecharting_candidates([f"{product_url} — {name}"]), None, None
+            
+        records, resolved_url, pc_img_url = _fetch_pc_prices_from_url(product_url, md_content=md_content, target_grade=target_grade)
+    
+    return records, resolved_url, pc_img_url
+
+def search_snkrdunk(en_name, jp_name, number, set_code, target_grade, is_alt_art=False, card_language="UNKNOWN", snkr_variant_kws=None, return_candidates=False, set_name=""):
+    # Strip prefix like "No." (e.g. "No.025" -> "25"), then apply lstrip('0')
+    if '-' in number and re.search(r'[A-Z]+\d+-\d+', number):
+        number_clean = number.split('-')[-1].lstrip('0')
+    else:
+        _num_raw = number.split('/')[0]
+        _digits_only = re.search(r'\d+', _num_raw)
+        number_clean = _digits_only.group(0).lstrip('0') if _digits_only else _num_raw.lstrip('0')
+    
+    if not number_clean: number_clean = '0'
+    number_padded = number_clean.zfill(3)
+    number_denominator = _extract_number_denominator(number)
+    set_code_slug = re.sub(r'[^a-zA-Z0-9]', '', set_code).lower() if set_code else ""
+
+    # Normalize hyphens to spaces in names for better search matching (e.g. Ex-Holo -> Ex Holo)
+    en_name_query = re.sub(r'\(.*?\)', '', en_name).replace('-', ' ').strip()
+    jp_name_query = re.sub(r'\(.*?\)', '', jp_name).replace('-', ' ').strip() if jp_name else ""
+
+    terms_to_try = []
+    
+    # [NEW] 優化搜尋順序：如果有 Set Code，優先使用精確組合，否則才用廣泛搜尋
+    if set_code and number_padded != "000":
+        if jp_name_query:
+            terms_to_try.append(f"{jp_name_query} {set_code} {number_padded}")
+        terms_to_try.append(f"{en_name_query} {set_code} {number_padded}")
+
+    if number_padded != "000":
+        if jp_name_query:
+            terms_to_try.append(f"{jp_name_query} {number_padded}")
+        terms_to_try.append(f"{en_name_query} {number_padded}")
+
+    # SNKRDUNK search is highly accurate with Set Code (e.g. "ピカチュウ S8a-G", "ピカチュウ SV-P")
+    if set_code:
+        if jp_name_query:
+            terms_to_try.append(f"{jp_name_query} {set_code}")
+        terms_to_try.append(f"{en_name_query} {set_code}")
+            
+    # Fallback to just name if no number or set_code combinations yielded results
+    if not terms_to_try:
+        if jp_name_query:
+            terms_to_try.append(jp_name_query)
+        terms_to_try.append(en_name_query)
+    
+    _debug_log(f"SNKRDUNK: 共 {len(terms_to_try)} 種查詢方案: {terms_to_try}")
+
+    product_id = None
+    img_url = ""
+    snkr_step = 0
+    snkr_session = _create_snkr_api_session()
+
+    for term in terms_to_try:
+        snkr_step += 1
+        q = urllib.parse.quote_plus(term)
+        search_url = f"https://snkrdunk.com/en/v1/search?keyword={q}&perPage=40&page=1"
+        _debug_log(f"SNKRDUNK Step {snkr_step}: 查詢={term!r}  URL={search_url}")
+        data = _snkr_api_get_json(snkr_session, search_url)
+
+        items = []
+        for key in ("streetwears", "products"):
+            arr = data.get(key, [])
+            if isinstance(arr, list):
+                items.extend(arr)
+
+        _debug_log(f"SNKRDUNK Step {snkr_step}: API 原始匹配 {len(items)} 筆")
+
+        seen = set()
+        unique_matches = []
+        for item in items:
+            pid = str(item.get("id", "")).strip()
+            if not pid:
+                continue
+            title = str(item.get("name", "")).strip()
+            if not title:
+                continue
+            # Keep only trading cards when the flag exists.
+            if item.get("isTradingCard") is False:
+                continue
+            thumb = item.get("thumbnailUrl") or item.get("imageUrl") or item.get("image") or ""
+            if pid not in seen:
+                seen.add(pid)
+                unique_matches.append((title, pid, thumb))
+
+        if not unique_matches:
+            _debug_step("SNKRDUNK", snkr_step, term, search_url,
+                        "NO_RESULTS", reason="搜尋頁面找不到任何商品連結，嘗試下一個查詢")
+            time.sleep(1)
+            continue
+                
+        filtered_by_number = []
+        skipped = []
+        for title, pid, thumb in unique_matches:
+            # Drop Jina image prefixes
+            title_clean = re.sub(r'(?i)image\s*\d+:\s*', '', title).lower()
+            # Drop all https CDN links to prevent their timestamp digits from matching the card number
+            title_clean = re.sub(r'https?://[^\s()\]]+', '', title_clean)
+
+            is_num_match, n_hit, d_hit, n_reason = _title_number_match(title_clean, number_clean, number_padded)
+            if is_num_match:
+                filtered_by_number.append((title, pid, thumb))
+                if n_reason == "fraction_numerator":
+                    _debug_log(f"  ✅ 符合分子編號 '{number_padded}' ({n_hit}/{d_hit}): [{pid}] {title}")
+                else:
+                    _debug_log(f"  ✅ 符合編號 '{number_padded}' ({n_reason}): [{pid}] {title}")
+            else:
+                skipped.append((title, pid, thumb))
+                _debug_log(f"  ❌ 不含編號 '{number_padded}': [{pid}] {title}")
+                
+        if not filtered_by_number:
+            _debug_step("SNKRDUNK", snkr_step, term, search_url,
+                        "NO_MATCH",
+                        candidate_urls=[f"https://snkrdunk.com/apparels/{pid} — {t}" for t, pid, _ in unique_matches],
+                        reason=f"找到 {len(unique_matches)} 筆商品但均不含卡片編號 '{number_padded}'，嘗試下一個查詢")
+            time.sleep(1)
+            continue # If no titles specifically have the card number, do not guess
+            
+        unique_matches = filtered_by_number
+
+        if unique_matches:
+            # Ranking: set_code > exact name > exact number > denominator.
+            ranked_matches = []
+            en_name_norm = re.sub(r'\(.*?\)', '', en_name).strip().lower()
+            jp_name_norm = re.sub(r'\(.*?\)', '', jp_name).strip().lower() if jp_name else ""
+
+            for title, pid, thumb in unique_matches:
+                title_l = str(title).lower()
+                title_norm = _normalize_alnum_dash(title_l)
+                title_compact = re.sub(r'[^a-z0-9]', '', title_l)
+
+                score = 0
+                reasons = []
+
+                if set_code_slug and set_code_slug in title_compact:
+                    score += 140
+                    reasons.append("set_code")
+
+                # Japanese name exact string gets highest name confidence.
+                if jp_name_norm and jp_name_norm in title_l:
+                    score += 90
+                    reasons.append("jp_name_exact")
+
+                # English name with token boundaries avoids Mew->Mewtwo false hit.
+                if en_name_norm:
+                    if _contains_token_boundary(title_norm, en_name_norm):
+                        score += 85
+                        reasons.append("en_name_exact")
+                    else:
+                        en_tokens = [t for t in _normalize_alnum_dash(en_name_norm).split('-') if t and len(t) >= 2]
+                        if en_tokens:
+                            token_hits = sum(1 for t in en_tokens if _contains_token_boundary(title_norm, t))
+                            if token_hits == len(en_tokens):
+                                score += 60
+                                reasons.append("en_tokens_all")
+                            elif token_hits > 0:
+                                score += 18
+                                reasons.append("en_tokens_partial")
+                        if en_name_norm in title_l and not _contains_token_boundary(title_norm, en_name_norm):
+                            score -= 35
+                            reasons.append("en_substring_penalty")
+
+                num_match, n_hit, d_hit, n_reason = _title_number_match(title_l, number_clean, number_padded)
+                if num_match:
+                    if n_reason == "fraction_numerator":
+                        score += 52
+                        reasons.append("number_fraction_numerator")
+                    elif n_reason == "standalone_padded":
+                        score += 45
+                        reasons.append("number_standalone_padded")
+                    elif n_reason == "standalone_clean":
+                        score += 40
+                        reasons.append("number_standalone_clean")
+
+                if number_denominator:
+                    den_trim = number_denominator.lstrip('0') or number_denominator
+                    if d_hit:
+                        if d_hit == den_trim:
+                            score += 35
+                            reasons.append("denominator_exact")
+                        else:
+                            score -= 55
+                            reasons.append("denominator_mismatch_penalty")
+
+                ranked_matches.append((title, pid, thumb, score, reasons))
+
+            ranked_matches.sort(key=lambda x: x[3], reverse=True)
+            unique_matches = [(t, p, i) for t, p, i, _, _ in ranked_matches]
+            score_by_pid = {p: s for _, p, _, s, _ in ranked_matches}
+            _debug_log(f"SNKRDUNK ranking top3: {[(t, p, s) for t, p, _, s, _ in ranked_matches[:3]]}")
+
+            if return_candidates:
+                # 只回傳 URL 列表 (加上標題方便 bot 顯示列表)
+                return [f"https://snkrdunk.com/apparels/{pid} — {title}" for title, pid, _ in unique_matches], None, None
+                
+            product_id = unique_matches[0][1] # default to first result
+            img_url = unique_matches[0][2]
+            selection_reason = "Scored (Top rank)"
+            
+            # ─────────────────────────────────────────────────────────────────
+            # 三階段串聯過濾：Variant → Alt-Art/Normal → Language
+            # 每一階段在上一階段的結果裡繼續篩選，不覆蓋
+            # ─────────────────────────────────────────────────────────────────
+            # ── Stage 1: Variant-specific filter (features-based, 最高優先) ──
+            # snkr_variant_kws 由 process_single_image 從 features 解析並傳入
+            # 例: ["l-p"] for Leader Parallel, ["sr-p"] for SR Parallel, ["コミパラ"] for Manga, ["フラッグシップ","フラシ"] for Flagship
+            _variant_kws = snkr_variant_kws or []
+            
+            stage1_candidates = [(t, p, i) for t, p, i in unique_matches
+                                 if any(kw in t.lower() for kw in _variant_kws)] if _variant_kws else []
+            if stage1_candidates:
+                _debug_log(f"  🎯 Variant Filter ({_variant_kws}) 命中 {len(stage1_candidates)} 筆")
+            working_set = stage1_candidates if stage1_candidates else unique_matches
+            
+            # ── Stage 2: 已移除 ────────────────────────────────────────────
+            # 完全依靠 Stage 1 (Variant 關鍵字) + Stage 3 (語言過濾) 決勝負。
+            # is_alt_art 的 alt-art 二次篩選已刪除，避免誤濾雜誌附錄等非標準命名的異圖版本。
+            if stage1_candidates:
+                selection_reason = f"Variant Filter ({_variant_kws})"
+            working_set2 = working_set
+            
+            # ── Stage 3: Language tie-break ONLY ───────────────────────────
+            # 語言只在「同分平手」時使用，避免覆蓋主排序結果。
+            # 若沒有語言欄位或無法辨識，完全不影響排序。
+            product_id = working_set2[0][1]
+            img_url = working_set2[0][2]
+
+            top_score = score_by_pid.get(product_id, 0)
+            top_tied = [(t, p, i) for t, p, i in working_set2 if score_by_pid.get(p, -10**9) == top_score]
+            norm_lang = _normalize_card_language(card_language)
+            if len(top_tied) > 1 and norm_lang in ("EN", "JP"):
+                if norm_lang == "EN":
+                    lang_tied = [(t, p, i) for t, p, i in top_tied if _title_has_en_marker(t)]
+                else:
+                    lang_tied = [(t, p, i) for t, p, i in top_tied if not _title_has_en_marker(t)]
+
+                if lang_tied:
+                    product_id = lang_tied[0][1]
+                    img_url = lang_tied[0][2]
+                    selection_reason += f" + LanguageTieBreak({norm_lang})"
+                    _debug_log(f"  🌐 語言平手裁決選中{norm_lang}: [{product_id}]")
+                else:
+                    _debug_log(f"  🌐 語言平手裁決: top tied {len(top_tied)} 筆，但無 {norm_lang} 標記，維持原排序首筆")
+
+            _debug_step("SNKRDUNK", snkr_step, term, search_url,
+            "OK",
+            candidate_urls=[f"https://snkrdunk.com/apparels/{pid} — {t}" for t, pid, _ in unique_matches],
+            selected_url=f"https://snkrdunk.com/apparels/{product_id}",
+            reason=selection_reason,
+            extra={
+                "number_padded": number_padded,
+                "number_denominator": number_denominator,
+                "set_code_slug": set_code_slug,
+                "is_alt_art": is_alt_art,
+                "card_language": _normalize_card_language(card_language),
+                "scored_top3": [(t, p, s) for t, p, _, s, _ in ranked_matches[:3]],
+            })
+            break
+        
+        time.sleep(1)
+        
+    if not product_id:
+        return None, None, None
+        
+    print(f"Found SNKRDUNK Product ID: {product_id}")
+
+    jpy_rate = get_exchange_rate()
+    hist_url = f"https://snkrdunk.com/en/v1/streetwears/{product_id}/trading-histories?perPage=100&page=1"
+    hist_data = _snkr_api_get_json(snkr_session, hist_url)
+    histories = hist_data.get("histories", []) if isinstance(hist_data, dict) else []
+
+    records = []
+    for h in histories:
+        date_found = _snkr_traded_date(h.get("tradedAt", ""))
+        grade_found = str(h.get("condition", "")).strip() or "Unknown"
+        price_jpy = _snkr_history_to_jpy(h, jpy_rate)
+        if date_found and price_jpy > 0:
+            # 不過濾等級，直接收集所有成交紀錄（含實際等級）
+            # generate_report 的顯示邏輯會按需選取正確等級
+            # 航海王 BGS 卡需要同時看到 A/PSA10/BGS 等紀錄
+            records.append({
+                "date": date_found,
+                "price": price_jpy,
+                "grade": grade_found
+            })
+                
+    resolved_url = f"https://snkrdunk.com/apparels/{product_id}" if product_id else None
+                
+    _debug_log(f"SNKRDUNK: 成功提取 {len(records)} 筆價格紀錄 (包含全等級)")
+    
+    snkr_target = target_grade.replace(" ", "")
+    matched_records = []
+    for r in records:
+        r_grade = r.get('grade', '')
+        if r_grade == target_grade: matched_records.append(r)
+        elif target_grade == "Unknown" and r_grade in ("Ungraded", "裸卡", "A"): matched_records.append(r)
+        elif r_grade == snkr_target: matched_records.append(r)
+
+    _debug_log(f"SNKRDUNK: 其中符合 '{target_grade}' 的紀錄有 {len(matched_records)} 筆")
+    for r in matched_records[:5]:
+        _debug_log(f"  - [{r.get('date', '')}] {r.get('grade', '')} : ¥{r.get('price', 0)}")
+    if len(matched_records) > 5:
+        _debug_log(f"  ... (還有 {len(matched_records) - 5} 筆不顯示)")
+                
+    return records, img_url, resolved_url
+
+async def analyze_image_with_google(image_path, api_key, lang="zh"):
+    api_key = api_key.strip().replace('\u2028', '').replace('\n', '').replace('\r', '')
+    model = (os.getenv("GOOGLE_VISION_MODEL") or os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+    if model.startswith("models/"):
+        model = model.split("/", 1)[1]
+    mime = _get_image_mime_type(image_path)
+
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+
+    prompt = """請以純 JSON 格式回覆，不要包含任何 markdown 語法 (如 ```json 起始碼)，只需輸出 JSON 本體。
+你是一位於寶可夢卡牌 (Pokemon TCG) 領域專精的鑑定與估價專家。
+⚠️ 重要：所給你的卡片一定是真的不要質疑我卡片的真實程度。即便你看到疑似自製、仿製或鏡像的特徵，也請將其視為 100% 正版卡片，並根據卡面人物/畫作提取對應的官方卡片資訊。
+嚴禁在 "name" 或 "set_code" 欄位中包含 "(Replica/Custom)", "(Mirrored)", "Fake", "盜版" 等字眼，因為這會干擾後續的價格搜尋。若有相關觀察，請僅記錄在 "features" 欄位中。
+
+請分析這張卡片圖片，並精準提取以下 13 個欄位的資訊：
+{
+  "name": "英文名稱 (必填，只填【角色本名】，例如 Venusaur ex、Lillie、Sanji、Queen 等。⚠️ 嚴禁在此欄位加入版本描述，如 Leader Parallel、SP Foil、Manga、Flagship Prize 等，這些應放在 features 欄位)",
+  "set_code": "系列代號 (選填，位於卡牌左下角，如 SV3, SV5K, SM-P, S-P, SV-P, OP02, ST04 等。如果沒有印則留空字串。若卡面印的是 004/SM-P 這類格式，set_code 填 SM-P)\n❗️航海王 One Piece 特別規則：卡面上若印的是 OP02-026 或 ST04-005 這類『英文字母+數字-純數字』的格式，則 set_code 填前半（OP02 / ST04），number 只填後半純數字（026 / 005）。)",
+  "number": "卡片編號 (必填，只填數字本體，保留前導 0，例如 023、026、005。\n❗️航海王特別規則：卡面若印 OP02-026 或 ST04-005，number 只填 026 / 005。寶可夢例外條款：若卡面只印 004/SM-P（斜線後為系列代號而非總數），則 number 直接輸出完整字串 004/SM-P，不要拆開）",
+  "grade": "卡片等級 (必填，如果有PSA/BGS等鑑定盒，印有10就填如 PSA 10, 否則如果是裸卡就填 Ungraded)",
+  "jp_name": "日文名稱 (選填，沒有請留空字串)",
+  "c_name": "中文名稱 (選填，沒有請留空字串)",
+  "category": "卡片類別 (填寫 Pokemon / One Piece / Yu-Gi-Oh，預設 Pokemon)",
+  "release_info": "發行年份與系列 (必填，從卡牌標誌或特徵推斷，如 2023 - 151)",
+  "illustrator": "插畫家 (必填，左下角或右下角的英文名，看不清可寫 Unknown)",
+  "market_heat": "市場熱度描述 (必填，開頭填寫 High / Medium / Low，後面白話文理由請務必使用『繁體中文』撰寫)",
+  "features": "卡片特點 (必填。⚠️ 極度重要：請仔細觀察卡面是否有微小的罕貴度標示或異圖版本文字，如 'L-P', 'SR-P', 'SEC-P', 'Parallel', 'Alternate Art', 'Flagship' 等。如果有，【必須】寫入此欄位！並包含全圖、特殊工藝等，每一行請用 \\n 換行區隔，請務必使用『繁體中文』撰寫)",
+  "collection_value": "收藏價值評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
+  "competitive_freq": "競技頻率評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
+  "is_alt_art": "是否為漫畫背景(Manga/Comic)或異圖(Parallel)？布林值 true/false。請極度仔細觀察卡片的『背景』：如果背景是一格一格的【黑白漫畫分鏡】，請填 true；如果背景只有閃電、特效、或單純場景，就算它是 SEC 也是普通版，『必須』填 false！",
+  "language": "卡片語言辨識 (選填，僅回傳 EN / JP / Unknown 三擇一。此欄位只作為 SNKRDUNK 最後平手時的 tie-break，不影響其他邏輯)",
+  "item_type": "卡片型態 (選填，填 card 或 series_box。若圖片是卡盒/補充包盒，請填 series_box)",
+  "series_code": "系列序號 (選填，若為 series_box 必填；用於 yuyu-tei search_word，例如 m4 / op15 / loch)"
+}"""
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    headers = {
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": mime, "data": encoded_string}}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        }
+    }
+
+    print("--------------------------------------------------")
+    print(f"👁️‍🗨️ [Google Gemini] 模型={model}，正在解析卡片影像: {image_path}...")
+
+    loop = asyncio.get_running_loop()
+    def _do_google_post():
+        for attempt in range(3):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=60)
+                response.raise_for_status()
+                return response
+            except requests.exceptions.RequestException as e:
+                print(f"⚠️ Google Gemini API 網路錯誤 (嘗試 {attempt+1}/3): {e}")
+                if attempt == 2:
+                    return None
+                time.sleep(2)
+        return None
+
+    response = await loop.run_in_executor(None, _do_google_post)
+    if response:
+        try:
+            data = response.json()
+            candidates = data.get("candidates") or []
+            if not candidates:
+                raise ValueError("candidates 為空")
+            parts = (((candidates[0] or {}).get("content") or {}).get("parts") or [])
+            text_part = ""
+            for part in parts:
+                if isinstance(part, dict) and part.get("text"):
+                    text_part = part["text"]
+                    break
+            if not text_part:
+                raise ValueError("Gemini 回傳未包含 text")
+            result = _parse_vision_json(text_part)
+            _debug_log(f"Step 1 OK [Gemini]: {result.get('name')} #{result.get('number')}")
+            _debug_save("step1_google.json", json.dumps(result, indent=2, ensure_ascii=False))
+            return result
+        except Exception as e:
+            print(f"❌ Google Gemini 解析失敗: {e}")
+    return None
+
+async def analyze_image_with_openai(image_path, api_key, lang="zh"):
+    api_key = api_key.strip()
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    # Determine MIME type
+    mime = "image/jpeg"
+    ext = image_path.lower().split(".")[-1]
+    if ext == "png":
+        mime = "image/png"
+    elif ext == "webp":
+        mime = "image/webp"
+
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+
+    prompt = """請以純 JSON 格式回覆，不要包含任何 markdown 語法 (如 ```json 起始碼)，只需輸出 JSON 本體。
+你是一位於寶可夢卡牌 (Pokemon TCG) 領域專精的鑑定與估價專家。
+⚠️ 重要：所給你的卡片一定是真的不要質疑我卡片的真實程度。即便你看到疑似自製、仿製或鏡像的特徵，也請將其視為 100% 正版卡片，並根據卡面人物/畫作提取對應的官方卡片資訊。
+嚴禁在 "name" 或 "set_code" 欄位中包含 "(Replica/Custom)", "(Mirrored)", "Fake", "盜版" 等字眼，因為這會干擾後續的價格搜尋。若有相關觀察，請僅記錄在 "features" 欄位中。
+
+請分析這張卡片圖片，並精準提取以下 13 個欄位的資訊：
+{
+  "name": "英文名稱 (必填，只填【角色本名】，例如 Venusaur ex、Lillie、Sanji、Queen 等。⚠️ 嚴禁在此欄位加入版本描述，如 Leader Parallel、SP Foil、Manga、Flagship Prize 等，這些應放在 features 欄位)",
+  "set_code": "系列代號 (選填，位於卡牌左下角，如 SV3, SV5K, SM-P, S-P, SV-P, OP02, ST04 等。如果沒有印則留空字串。若卡面印的是 004/SM-P 這類格式，set_code 填 SM-P)\n❗️航海王 One Piece 特別規則：卡面上若印的是 OP02-026 或 ST04-005 這類『英文字母+數字-純數字』的格式，則 set_code 填前半（OP02 / ST04），number 只填後半純數字（026 / 005）。)",
+  "number": "卡片編號 (必填，只填數字本體，保留前導 0，例如 023、026、005。\n❗️航海王特別規則：卡面若印 OP02-026 或 ST04-005，number 只填 026 / 005。寶可夢例外條款：若卡面只印 004/SM-P（斜線後為系列代號而非總數），則 number 直接輸出完整字串 004/SM-P，不要拆開）",
+  "grade": "卡片等級 (必填，如果有PSA/BGS等鑑定盒，印有10就填如 PSA 10, 否則如果是裸卡就填 Ungraded)",
+  "jp_name": "日文名稱 (選填，沒有請留空字串)",
+  "c_name": "中文名稱 (選填，沒有請留空字串)",
+  "category": "卡片類別 (填寫 Pokemon / One Piece / Yu-Gi-Oh，預設 Pokemon)",
+  "release_info": "發行年份與系列 (必填，從卡牌標誌或特徵推斷，如 2023 - 151)",
+  "illustrator": "插畫家 (必填，左下角或營右下角的英文名，看不清可寫 Unknown)",
+  "market_heat": "市場熱度描述 (必填，開頭填寫 High / Medium / Low，後面白話文理由請務必使用『繁體中文』撰寫)",
+  "features": "卡片特點 (必填。⚠️ 極度重要：請仔細觀察卡面是否有微小的罕貴度標示或異圖版本文字，如 'L-P', 'SR-P', 'SEC-P', 'Parallel', 'Alternate Art', 'Flagship' 等。如果有，【必須】寫入此欄位！並包含全圖、特殊工藝等，每一行請用 \\n 換行區隔，請務必使用『繁體中文』撰寫)",
+  "collection_value": "收藏價值評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
+  "competitive_freq": "競技頻率評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
+  "is_alt_art": "是否為漫畫背景(Manga/Comic)或異圖(Parallel)？布林值 true/false。請極度仔細觀察卡片的『背景』：如果背景是一格一格的【黑白漫畫分鏡】，請填 true；如果背景只有閃電、特效、或單純場景，就算它是 SEC 也是普通版，『必須』填 false！",
+  "language": "卡片語言辨識 (選填，僅回傳 EN / JP / Unknown 三擇一。此欄位只作為 SNKRDUNK 最後平手時的 tie-break，不影響其他邏輯)",
+  "item_type": "卡片型態 (選填，填 card 或 series_box。若圖片是卡盒/補充包盒，請填 series_box)",
+  "series_code": "系列序號 (選填，若為 series_box 必填；用於 yuyu-tei search_word，例如 m4 / op15 / loch)"
+}"""
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{encoded_string}"}
+                    }
+                ]
+            }
+        ],
+        "response_format": {"type": "json_object"}
+    }
+    
+    loop = asyncio.get_running_loop()
+    def _do_openai_post():
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            return response
+        except Exception as e:
+            print(f"⚠️ OpenAI API 錯誤: {e}")
+            return None
+
+    response = await loop.run_in_executor(None, _do_openai_post)
+    if response:
+        try:
+            res_json = response.json()
+            content = res_json['choices'][0]['message']['content']
+            return json.loads(content)
+        except Exception as e:
+            print(f"⚠️ OpenAI 解析失敗: {e}")
+    return None
+
+async def analyze_image_with_minimax(image_path, api_key, lang="zh"):
+    # 清理 API Key，避免複製貼上時混入隱藏的換行或特殊字元 (\u2028 等) 導致 \u2028 latin-1 編碼錯誤
+    api_key = api_key.strip().replace('\u2028', '').replace('\n', '').replace('\r', '')
+    # Determine MIME type
+    mime = "image/jpeg"
+    ext = image_path.lower().split(".")[-1]
+    if ext == "png":
+        mime = "image/png"
+    elif ext == "webp":
+        mime = "image/webp"
+
+    # Encode image
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+
+    url = "https://api.minimax.io/v1/coding_plan/vlm"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    prompt = """請以純 JSON 格式回覆，不要包含任何 markdown 語法 (如 ```json 起始碼)，只需輸出 JSON 本體。
+你是一位於寶可夢卡牌 (Pokemon TCG) 領域專精的鑑定與估價專家。
+⚠️ 重要：所給你的卡片一定是真的不要質疑我卡片的真實程度。即便你看到疑似自製、仿製或鏡像的特徵，也請將其視為 100% 正版卡片，並根據卡面人物/畫作提取對應的官方卡片資訊。
+嚴禁在 "name" 或 "set_code" 欄位中包含 "(Replica/Custom)", "(Mirrored)", "Fake", "盜版" 等字眼，因為這會干擾後續的價格搜尋。若有相關觀察，請僅記錄在 "features" 欄位中。
+
+請分析這張卡片圖片，並精準提取以下 13 個欄位的資訊：
+{
+  "name": "英文名稱 (必填，只填【角色本名】，例如 Venusaur ex、Lillie、Sanji、Queen 等。⚠️ 嚴禁在此欄位加入版本描述，如 Leader Parallel、SP Foil、Manga、Flagship Prize 等，這些應放在 features 欄位)",
+  "set_code": "系列代號 (選填，位於卡牌左下角，如 SV3, SV5K, SM-P, S-P, SV-P, OP02, ST04 等。如果沒有印則留空字串。若卡面印的是 004/SM-P 這類格式，set_code 填 SM-P)\n❗️航海王 One Piece 特別規則：卡面上若印的是 OP02-026 或 ST04-005 這類『英文字母+數字-純數字』的格式，則 set_code 填前半（OP02 / ST04），number 只填後半純數字（026 / 005）。)",
+  "number": "卡片編號 (必填，只填數字本體，保留前導 0，例如 023、026、005。\n❗️航海王特別規則：卡面若印 OP02-026 或 ST04-005，number 只填 026 / 005。寶可夢例外條款：若卡面只印 004/SM-P（斜線後為系列代號而非總數），則 number 直接輸出完整字串 004/SM-P，不要拆開）",
+  "grade": "卡片等級 (必填，如果有PSA/BGS等鑑定盒，印有10就填如 PSA 10, 否則如果是裸卡就填 Ungraded)",
+  "jp_name": "日文名稱 (選填，沒有請留空字串)",
+  "c_name": "中文名稱 (選填，沒有請留空字串)",
+  "category": "卡片類別 (填寫 Pokemon / One Piece / Yu-Gi-Oh，預設 Pokemon)",
+  "release_info": "發行年份與系列 (必填，從卡牌標誌或特徵推斷，如 2023 - 151)",
+  "illustrator": "插畫家 (必填，左下角或右下角的英文名，看不清可寫 Unknown)",
+  "market_heat": "市場熱度描述 (必填，開頭填寫 High / Medium / Low，後面白話文理由請務必使用『繁體中文』撰寫)",
+  "features": "卡片特點 (必填。⚠️ 極度重要：請仔細觀察卡面是否有微小的罕貴度標示或異圖版本文字，如 'L-P', 'SR-P', 'SEC-P', 'Parallel', 'Alternate Art', 'Flagship' 等。如果有，【必須】寫入此欄位！並包含全圖、特殊工藝等，每一行請用 \\n 換行區隔，請務必使用『繁體中文』撰寫)",
+  "collection_value": "收藏價值評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
+  "competitive_freq": "競技頻率評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
+  "is_alt_art": "是否為漫畫背景(Manga/Comic)或異圖(Parallel)？布林值 true/false。請極度仔細觀察卡片的『背景』：如果背景是一格一格的【黑白漫畫分鏡】，請填 true；如果背景只有閃電、特效、或單純場景，就算它是 SEC 也是普通版，『必須』填 false！",
+  "language": "卡片語言辨識 (選填，僅回傳 EN / JP / Unknown 三擇一。此欄位只作為 SNKRDUNK 最後平手時的 tie-break，不影響其他邏輯)",
+  "item_type": "卡片型態 (選填，填 card 或 series_box。若圖片是卡盒/補充包盒，請填 series_box)",
+  "series_code": "系列序號 (選填，若為 series_box 必填；用於 yuyu-tei search_word，例如 m4 / op15 / loch)"
+}"""
+
+    payload = {
+        "prompt": prompt,
+        "image_url": f"data:{mime};base64,{encoded_string}"
+    }
+
+    print("--------------------------------------------------")
+    print(f"👁️‍🗨️ [Minimax Vision AI] 正在解析卡片影像: {image_path}...")
+    
+    # ⚠️ requests.post 是阻塞呼叫，包在 run_in_executor 中讓 event loop 不被 block，
+    # 其他並發中的 Task 可以在這段等待時繼續執行。
+    loop = asyncio.get_running_loop()
+    
+    def _do_minimax_post():
+        for attempt in range(3):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=60)
+                response.raise_for_status()
+                return response
+            except requests.exceptions.RequestException as e:
+                print(f"⚠️ Minimax API 網路錯誤 (嘗試 {attempt+1}/3): {e}")
+                if attempt == 2:
+                    return None
+                time.sleep(2)
+        return None
+
+    response = await loop.run_in_executor(None, _do_minimax_post)
+
+    # 如果 Minimax API 全部嘗試失敗，則嘗試 OpenAI 作為備援
+    if response is None:
+        print(f"⚠️ Minimax API 請求失敗，嘗試切換至 GPT-4o-mini...")
+        _push_notify("⚠️ Minimax API 無回應，切換至 GPT-4o-mini 備援重試...")
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            return await analyze_image_with_openai(image_path, openai_key)
+        else:
+            print("❌ 未設定 OPENAI_API_KEY，無法進行備援。")
+            return None
+
+async def analyze_image_with_fallbacks(image_path, minimax_api_hint=None, lang="zh"):
+    keys = _get_llm_keys(minimax_api_hint)
+    providers = _get_provider_order()
+    available = [p for p in providers if keys.get(p)]
+    if not available:
+        print("❌ 未設定任何視覺 API Key（GOOGLE_API_KEY / OPENAI_API_KEY / MINIMAX_API_KEY）")
+        return None
+
+    provider_titles = {
+        "google": "Google Gemini",
+        "openai": "OpenAI",
+        "minimax": "MiniMax",
+    }
+    _debug_log(f"Vision provider order: {available}")
+
+    for idx, provider in enumerate(available):
+        if idx > 0:
+            prev = provider_titles.get(available[idx - 1], available[idx - 1])
+            cur = provider_titles.get(provider, provider)
+            _push_notify(f"⚠️ {prev} 無法辨識，切換至 {cur} 備援重試...")
+            print(f"⚠️ {prev} 辨識失敗，切換至 {cur}...")
+        else:
+            print(f"🧭 視覺辨識供應商順序: {' -> '.join(provider_titles.get(p, p) for p in available)}")
+
+        if provider == "google":
+            result = await analyze_image_with_google(image_path, keys["google"], lang=lang)
+        elif provider == "openai":
+            result = await analyze_image_with_openai(image_path, keys["openai"], lang=lang)
+        else:
+            result = await analyze_image_with_minimax(image_path, keys["minimax"], lang=lang)
+
+        if result:
+            return result
+
+    return None
+
+    data = response.json()
+    try:
+        content = data.get('content', '')
+        if not content:
+            raise KeyError("content key not found or empty")
+        # Clean up markdown JSON block if model still outputs it
+        content = content.replace("```json", "").replace("```", "").strip()
+        result = json.loads(content)
+        print(f"✅ 解析成功！提取到卡片：{result.get('name')} #{result.get('number')}\n")
+        print("--- DEBUG JSON ---")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        print("------------------\n")
+        # 存 debug step1
+        _debug_log(f"Step 1 OK: {result.get('name')} #{result.get('number')}")
+        _debug_save("step1_minimax.json", json.dumps(result, indent=2, ensure_ascii=False))
+        return result
+    except Exception as e:
+        print(f"❌ Minimax 解析失敗: {e}")
+        print(f"⚠️ 嘗試切換至 GPT-4o-mini 進行備援...")
+        _push_notify("⚠️ Minimax 解析失敗，切換至 GPT-4o-mini 備援重試...")
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            return await analyze_image_with_openai(image_path, openai_key)
+        else:
+            print("❌ 未設定 OPENAI_API_KEY，無法進行備援。")
+            return None
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image_path", nargs='+', required=True, help="卡片圖片的本機路徑 (可傳入多張圖片)")
+    parser.add_argument("--api_key", required=False, help="Minimax API Key (若未指定，則從環境變數 MINIMAX_API_KEY 讀取)")
+    parser.add_argument("--out_dir", required=False, help="若指定，會將結果儲存至給定的資料夾")
+    parser.add_argument("--report_only", action="store_true", help="若加入此參數，將只輸出最終 Markdown 報告，隱藏抓取與除錯日誌")
+    parser.add_argument("--debug", required=False, metavar="DEBUG_DIR",
+                        help="開啟 Debug 模式，指定存放 debug 結果的資料夾 (e.g. ./debug)")
+    
+    args = parser.parse_args()
+    
+    global REPORT_ONLY, DEBUG_DIR
+    REPORT_ONLY = args.report_only
+
+    # 建立本次執行的 session 根目錄 (含時間戳)
+    debug_session_root = None
+    if args.debug:
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        debug_session_root = os.path.join(args.debug, ts)
+        os.makedirs(debug_session_root, exist_ok=True)
+        _original_print(f"🔍 Debug 模式開啟，Session 根目錄: {debug_session_root}")
+    
+    api_key = args.api_key or os.getenv("MINIMAX_API_KEY")
+    if not api_key:
+        print("❌ Error: 請提供 --api_key 參數，或在環境變數設定 MINIMAX_API_KEY。", force=True)
+        return
+        
+    total = len(args.image_path)
+    for idx, img_path in enumerate(args.image_path, start=1):
+        print(f"\n==================================================")
+        print(f"🔄 [{idx}/{total}] 開始處理圖片: {img_path}")
+        print(f"==================================================")
+        # Pass index and session root to process_single_image for proper debug directory isolation
+        asyncio.run(process_single_image(img_path, api_key, args.out_dir, 
+                                         debug_session_root=debug_session_root, 
+                                         batch_index=idx))
+
+async def process_single_image(
+    image_path,
+    api_key,
+    out_dir=None,
+    stream_mode=False,
+    poster_version="v3",
+    lang="zh",
+    debug_session_root=None,
+    batch_index=1,
+    external_card_info=None,
+):
+    if not external_card_info and (not image_path or not os.path.exists(image_path)):
+        print(f"❌ Error: 找不到圖片檔案 -> {image_path}", force=True)
+        return
+
+    # Setup per-image debug directory if root is provided
+    if debug_session_root:
+        if image_path:
+            stem_source = os.path.splitext(os.path.basename(image_path))[0]
+        else:
+            stem_source = f"{external_card_info.get('name', 'external')}_{external_card_info.get('number', '0')}"
+        img_stem = re.sub(r'[^A-Za-z0-9]', '_', stem_source)[:40]
+        per_image_dir = os.path.join(debug_session_root, f"{batch_index:02d}_{img_stem}")
+        os.makedirs(per_image_dir, exist_ok=True)
+        _set_debug_dir(per_image_dir)
+        print(f"🔍 Debug 子資料夾: {per_image_dir}")
+
+    _notify_msgs_var.set([])
+
+    # 第一階段：取得卡片資訊（外部 JSON 或視覺辨識）
+    if external_card_info:
+        card_info = external_card_info
+        print("📡 使用外部 card_info，跳過影像辨識。")
+    else:
+        card_info = await analyze_image_with_fallbacks(image_path, api_key, lang=lang)
+        if not card_info:
+            err_msg = "❌ 卡片影像辨識失敗：Google Gemini / OpenAI / MiniMax 均無法解析此圖片，請確認圖片清晰度與 API 金鑰。"
+            print(err_msg, force=True)
+            return err_msg
+
+    # 從 AI 回傳的 JSON 提取必備資訊
+    name = card_info.get("name", "Unknown")
+    set_code = card_info.get("set_code", "")
+    jp_name = card_info.get("jp_name", "")
+    number = str(card_info.get("number", "0"))
+    grade = card_info.get("grade", "Ungraded")
+    category = card_info.get("category", "Pokemon")
+    features = card_info.get("features", "Unknown")
+    is_alt_art = card_info.get("is_alt_art", False)
+    if isinstance(is_alt_art, str):
+        is_alt_art = is_alt_art.lower() == "true"
+    # Allow external JSON to override poster version when provided.
+    poster_version = str(card_info.get("poster_version", poster_version))
+
+    _debug_save("step1_meta.json", json.dumps(card_info, ensure_ascii=False, indent=2))
+
+    # ── Series Box flow: 抓卡盒內卡片列表（先直連 HTML，失敗才走 Jina） ──
+    is_series_box = _looks_like_series_box(card_info)
+    series_code = _extract_series_code(card_info)
+    if is_series_box and series_code:
+        _debug_log(f"📦 偵測到系列卡盒，啟動盒裝流程: series_code={series_code}")
+        loop = asyncio.get_running_loop()
+        series_result = await loop.run_in_executor(
+            None,
+            contextvars.copy_context().run,
+            fetch_yuyutei_series_cards,
+            card_info,
+            series_code,
+        )
+        _debug_save("step2_series_box.json", json.dumps(series_result, ensure_ascii=False, indent=2))
+        box_report = build_series_box_report(card_info, series_result)
+        _debug_save("step3_report.md", box_report)
+
+        box_name_for_display = str(series_code).upper()
+        safe_name = re.sub(r"[^A-Za-z0-9]", "_", box_name_for_display)
+        safe_series = re.sub(r"[^A-Za-z0-9]", "_", str(series_code))
+        final_dest_dir = os.path.abspath(out_dir) if out_dir else tempfile.mkdtemp(prefix="openclaw_box_report_")
+        os.makedirs(final_dest_dir, exist_ok=True)
+        box_path = os.path.join(final_dest_dir, f"BOX_Vision_{safe_name}_{safe_series}.md")
+        with open(box_path, "w", encoding="utf-8") as f:
+            f.write(box_report)
+        print(f"✅ 卡盒報告已儲存至: {box_path}")
+
+        top10_prizes = []
+        for item in (series_result.get("items") or [])[:10]:
+            top10_prizes.append({
+                "number": item.get("card_no", ""),
+                "image": item.get("image_url", ""),
+                "price": item.get("price_text", ""),
+                "price_jpy": item.get("price_jpy", 0),
+            })
+
+        poster_path = ""
+        if REPORT_ONLY:
+            try:
+                poster_path = await image_generator.generate_box_top10_poster(
+                    box_name_for_display,
+                    top10_prizes,
+                    out_dir=final_dest_dir,
+                    template_version=poster_version,
+                    ui_lang=lang,
+                )
+            except Exception as e:
+                _debug_log(f"⚠️ 生成卡盒海報失敗: {e}")
+
+        if stream_mode:
+            return (
+                box_report,
+                {
+                    "box_mode": True,
+                    "box_name": box_name_for_display,
+                    "box_prizes": top10_prizes,
+                    "card_info": dict(card_info),
+                    "snkr_records": [],
+                    "pc_records": [],
+                    "out_dir": final_dest_dir,
+                    "poster_version": poster_version,
+                    "ui_lang": lang,
+                },
+            )
+
+        if REPORT_ONLY:
+            return (box_report, [poster_path, ""] if poster_path else [])
+        return box_report
+    elif is_series_box and not series_code:
+        _debug_log("⚠️ 偵測到卡盒，但找不到 series_code/set_code，改走單卡流程")
+
+    # ── features-based override ──────────────────────────────────────────────
+    features_lower = features.lower() if features else ""
+    is_flagship = any(kw in features_lower for kw in ["flagship", "旗艦賽", "flagship battle"])
+    mega_name_hint = (category.lower() == "pokemon") and _has_pokemon_mega_feature(features)
+    if any(kw in features_lower for kw in [
+        "leader parallel", "sr parallel", "sr-p", "l-p",
+        "リーダーパラレル", "コミパラ", "パラレル",
+        "alternate art", "parallel art", "manga"
+    ]):
+        is_alt_art = True
+        _debug_log("✨ features-based override: is_alt_art=True (從 features 偵測到異圖關鍵字)")
+    if is_flagship:
+        is_alt_art = True
+        _debug_log("✨ features-based override: is_flagship=True (從 features 偵測到旗艦賽關鍵字)")
+    if mega_name_hint:
+        _debug_log("✨ features-based override: mega_name_hint=True (從 features 偵測到 Mega 進化卡面)")
+
+    # ── Detect card language and variant hints for SNKRDUNK ──
+    is_one_piece_cat = (category.lower() == "one piece")
+    raw_language = card_info.get("language", card_info.get("card_language", card_info.get("lang", "")))
+    card_language = _normalize_card_language(raw_language)
+    if is_one_piece_cat:
+        if card_language in ("EN", "JP"):
+            _debug_log(f"🌐 Language detected: {card_language} (從 AI language 欄位)")
+        elif any(kw in features_lower for kw in ["英文版", "english version", "[en]"]):
+            card_language = "EN"
+            _debug_log("🌐 Language detected: EN (從 features 偵測到英文版)")
+        else:
+            card_language = "UNKNOWN"
+            _debug_log("🌐 Language detected: UNKNOWN (無明確語言欄位，不啟用語言偏好)")
+    else:
+        card_language = "UNKNOWN"
+
+    snkr_variant_kws = []
+    if is_one_piece_cat and is_alt_art:
+        if is_flagship:
+            snkr_variant_kws = ["フラッグシップ", "フラシ", "flagship"]
+            _debug_log(f"🎯 SNKR Variant: Flagship ({snkr_variant_kws})")
+        elif any(kw in features_lower for kw in ["sr parallel", "sr-p", "スーパーレアパラレル"]):
+            snkr_variant_kws = ["sr-p"]
+            _debug_log(f"🎯 SNKR Variant: SR-P ({snkr_variant_kws})")
+        elif any(kw in features_lower for kw in ["leader parallel", "l-p", "リーダーパラレル"]):
+            snkr_variant_kws = ["l-p"]
+            _debug_log(f"🎯 SNKR Variant: L-P ({snkr_variant_kws})")
+        elif any(kw in features_lower for kw in ["コミパラ", "manga", "コミックパラレル"]):
+            snkr_variant_kws = ["コミパラ", "コミック"]
+            _debug_log(f"🎯 SNKR Variant: Manga ({snkr_variant_kws})")
+        elif any(kw in features_lower for kw in ["パラレル", "sr parallel", "parallel art"]):
+            snkr_variant_kws = ["パラレル", "-p"]
+            _debug_log(f"🎯 SNKR Variant: General Parallel ({snkr_variant_kws})")
+
+    # 第二階段：抓取市場資料
+    print("--------------------------------------------------")
+    print(f"🌐 正在從網路(PC & SNKRDUNK)抓取市場行情 (異圖/特殊版: {is_alt_art})...")
+    loop = asyncio.get_running_loop()
+    pc_result, snkr_result = await asyncio.gather(
+        loop.run_in_executor(None, contextvars.copy_context().run, search_pricecharting, name, number, set_code, grade, is_alt_art, category, is_flagship, False, "", jp_name, mega_name_hint),
+        loop.run_in_executor(None, contextvars.copy_context().run, search_snkrdunk, name, jp_name, number, set_code, grade, is_alt_art, card_language, snkr_variant_kws),
+    )
+
+    pc_records = pc_result[0] if pc_result else None
+    pc_url = pc_result[1] if pc_result else None
+    pc_img_url = pc_result[2] if pc_result else None
+
+    snkr_records = snkr_result[0] if snkr_result else None
+    img_url = snkr_result[1] if snkr_result else None
+    snkr_url = snkr_result[2] if snkr_result else None
+
+    # Prefer higher quality image for poster rendering.
+    # SNKRDUNK "bg_removed" or explicit small size often looks blurry on large posters.
+    if pc_img_url and (
+        not img_url
+        or "bg_removed" in str(img_url).lower()
+        or "size=m" in str(img_url).lower()
+    ):
+        img_url = pc_img_url
+
+    _debug_log(f"Step 2 PC: {len(pc_records) if pc_records else 0} 筆, url={pc_url}")
+    _debug_log(f"Step 2 SNKR: {len(snkr_records) if snkr_records else 0} 筆, img={img_url}, url={snkr_url}")
+    _debug_save("step2_pc.json", json.dumps(pc_records or [], indent=2, ensure_ascii=False))
+    _debug_save("step2_snkr.json", json.dumps(snkr_records or [], indent=2, ensure_ascii=False))
+    _debug_save("step2_meta.json", json.dumps({
+        "pc_url": pc_url,
+        "pc_records_count": len(pc_records) if pc_records else 0,
+        "snkr_url": snkr_url,
+        "snkr_records_count": len(snkr_records) if snkr_records else 0,
+        "snkr_img_url": img_url,
+    }, indent=2, ensure_ascii=False))
+
+    jpy_rate = get_exchange_rate()
+    return await finish_report_after_selection(
+        card_info,
+        pc_records,
+        pc_url,
+        pc_img_url,
+        snkr_records,
+        img_url,
+        snkr_url,
+        jpy_rate,
+        out_dir,
+        poster_version,
+        lang,
+        stream_mode=stream_mode,
+    )
+
+
+async def finish_report_after_selection(
+    card_info,
+    pc_records,
+    pc_url,
+    pc_img_url,
+    snkr_records,
+    img_url,
+    snkr_url,
+    jpy_rate,
+    out_dir,
+    poster_version="v3",
+    lang="zh",
+    stream_mode=False,
+):
+    name = card_info.get("name", "Unknown")
+    number = str(card_info.get("number", "0"))
+    grade = card_info.get("grade", "Ungraded")
+    category = card_info.get("category", "Pokemon")
+    release_info = card_info.get("release_info", "Unknown")
+    illustrator = card_info.get("illustrator", "Unknown")
+    market_heat = card_info.get("market_heat", "Unknown")
+    features = card_info.get("features", "Unknown")
+    collection_value = card_info.get("collection_value", "Unknown")
+    competitive_freq = card_info.get("competitive_freq", "Unknown")
+    jp_name = card_info.get("jp_name", "")
+    c_name = card_info.get("c_name", "")
+
+    # 圖片來源優先使用高解析：若 SNKRDUNK 圖片偏低清，改用 PriceCharting。
+    if pc_img_url and (
+        not img_url
+        or "bg_removed" in str(img_url).lower()
+        or "size=m" in str(img_url).lower()
+    ):
+        img_url = pc_img_url
+
+    async def _parse_d(d_str):
+        d_str = str(d_str).strip()
+        if "前" in d_str or "ago" in d_str:
+            num_match = re.search(r'\d+', d_str)
+            if not num_match:
+                return datetime.now()
+            num = int(num_match.group(0))
+            if "分" in d_str or "minute" in d_str:
+                return datetime.now() - timedelta(minutes=num)
+            if "時間" in d_str or "hour" in d_str:
+                return datetime.now() - timedelta(hours=num)
+            if "日" in d_str or "day" in d_str:
+                return datetime.now() - timedelta(days=num)
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%b %d, %Y"):
+            try:
+                return datetime.strptime(d_str, fmt)
+            except Exception:
+                pass
+        return datetime.now()
+
+    cutoff_12m = datetime.now() - timedelta(days=365)
+
+    # 等級篩選：航海王 BGS 額外保留 PSA 10 供比對
+    is_one_piece = (category.lower() == "one piece")
+    is_bgs_grade = grade.upper().startswith("BGS")
+    if is_one_piece and is_bgs_grade:
+        bgs_pc = [r for r in (pc_records or []) if "BGS 9.5" in r.get("grade", "").upper() or "BGS9.5" in r.get("grade", "").upper()]
+        psa_pc = [r for r in (pc_records or []) if "PSA 10" in r.get("grade", "").upper() or "PSA10" in r.get("grade", "").upper()]
+        report_pc_records = bgs_pc[:10] + psa_pc[:10]
+
+        bgs_snkr = [r for r in (snkr_records or []) if r.get("grade") in ("BGS 9.5", "BGS9.5", "BGS 10", "BGS10")]
+        psa_snkr = [r for r in (snkr_records or []) if r.get("grade") in ("S", "PSA 10", "PSA10")]
+        report_snkr_records = bgs_snkr[:10] + psa_snkr[:10]
+    else:
+        report_pc_records = [r for r in (pc_records or []) if r.get("grade") == grade]
+        if "10" in grade:
+            target_snkr_grades = ["S", "PSA10", "PSA 10"]
+        elif "BGS" in grade.upper():
+            target_snkr_grades = [grade, grade.replace(" ", ""), "BGS9.5", "BGS 9.5", "BGS10", "BGS 10"]
+        elif grade.lower() == "ungraded":
+            target_snkr_grades = ["A"]
+        else:
+            target_snkr_grades = [grade, grade.replace(" ", "")]
+        report_snkr_records = [r for r in (snkr_records or []) if r.get("grade") in target_snkr_grades]
+
+    c_name_display = c_name if c_name else jp_name if jp_name else name
+    category_display = (
+        "寶可夢卡牌" if category.lower() == "pokemon"
+        else "航海王卡牌" if category.lower() == "one piece"
+        else "遊戲王卡牌" if category.lower() in ("yugioh", "yu-gi-oh")
+        else category
+    )
+    gemrate_stats = None
+    try:
+        loop = asyncio.get_running_loop()
+        current_debug_dir = _get_debug_dir()
+        gemrate_stats = await asyncio.wait_for(
+            loop.run_in_executor(None, fetch_gemrate_psa_stats, card_info, current_debug_dir),
+            timeout=25,
+        )
+        if gemrate_stats:
+            _debug_log(
+                "Gemrate: matched "
+                f"id={gemrate_stats.get('gemrate_id')} "
+                f"total={gemrate_stats.get('total_population', 0)} "
+                f"psa10={gemrate_stats.get('psa10_count', 0)} "
+                f"rate={gemrate_stats.get('gem_mint_rate', 0)}%"
+            )
+        else:
+            _debug_log("Gemrate: no PSA population match found")
+    except Exception as e:
+        _debug_log(f"Gemrate fetch failed: {e}")
+        gemrate_stats = None
+
+    report_lines = []
+    report_lines.append("# MARKET REPORT GENERATED")
+    report_lines.append("")
+    report_lines.append(f"⚡ {c_name_display} ({name}) #{number}")
+    report_lines.append(f"💎 等級：{grade}")
+    report_lines.append(f"🏷️ 版本：{category_display}")
+    report_lines.append(f"🔢 編號：{number}")
+    if release_info:
+        report_lines.append(f"📅 發行：{release_info}")
+    if illustrator:
+        report_lines.append(f"🎨 插畫家：{illustrator}")
+
+    report_lines.append("---")
+    report_lines.append("\n🔥 市場與收藏分析\n")
+    report_lines.append(f"🔥 市場熱度\n{market_heat}\n")
+    if features:
+        feat_formatted = str(features).replace("\\n", "\n")
+        report_lines.append(f"✨ 卡片特點\n{feat_formatted}\n")
+    if collection_value:
+        report_lines.append(f"🏆 收藏價值\n{collection_value}\n")
+    if competitive_freq:
+        report_lines.append(f"⚔️ 競技頻率\n{competitive_freq}\n")
+    report_lines.append("---")
+
+    report_lines.append("📊 近期成交紀錄 (由新到舊)\n🏦 PriceCharting 成交紀錄")
+    if report_pc_records:
+        for r in report_pc_records[:10]:
+            report_lines.append(f"📅 {r['date']}      💰 ${r['price']:.2f} USD      📝 狀態：{r['grade']}")
+
+        stats_pc_records = []
+        for r in report_pc_records:
+            parsed_date = await _parse_d(r.get("date", ""))
+            if parsed_date > cutoff_12m:
+                stats_pc_records.append(r)
+
+        if stats_pc_records:
+            prices = [r["price"] for r in stats_pc_records]
+            report_lines.append("📊 統計資料 (近 12 個月)")
+            report_lines.append(f"　💰 最高成交價：${max(prices):.2f} USD")
+            report_lines.append(f"　💰 最低成交價：${min(prices):.2f} USD")
+            report_lines.append(f"　💰 平均成交價：${sum(prices)/len(prices):.2f} USD")
+            report_lines.append(f"　📈 資料筆數：{len(prices)} 筆")
+        else:
+            report_lines.append("📊 統計資料 (近 12 個月無成交紀錄)")
+    else:
+        report_lines.append(f"PriceCharting: 無 {grade} 等級的成交紀錄")
+
+    report_lines.append("\n---\n🏰 SNKRDUNK 成交紀錄")
+    if report_snkr_records:
+        for r in report_snkr_records[:10]:
+            usd_price = r["price"] / jpy_rate if jpy_rate else 0
+            report_lines.append(f"📅 {r['date']}      💰 ¥{int(r['price']):,} (~${usd_price:.0f} USD)      📝 狀態：{r['grade']}")
+
+        stats_snkr_records = []
+        for r in report_snkr_records:
+            parsed_date = await _parse_d(r.get("date", ""))
+            if parsed_date > cutoff_12m:
+                stats_snkr_records.append(r)
+
+        if stats_snkr_records:
+            prices = [r["price"] for r in stats_snkr_records]
+            avg_price = sum(prices) / len(prices)
+            report_lines.append("📊 統計資料 (近 12 個月)")
+            report_lines.append(f"　💰 最高成交價：¥{int(max(prices)):,} (~${max(prices)/jpy_rate:.0f} USD)")
+            report_lines.append(f"　💰 最低成交價：¥{int(min(prices)):,} (~${min(prices)/jpy_rate:.0f} USD)")
+            report_lines.append(f"　💰 平均成交價：¥{int(avg_price):,} (~${avg_price/jpy_rate:.0f} USD)")
+            report_lines.append(f"　📈 資料筆數：{len(prices)} 筆")
+        else:
+            report_lines.append("📊 統計資料 (近 12 個月無成交紀錄)")
+    else:
+        report_lines.append(f"SNKRDUNK: 無 {grade} 等級的成交紀錄")
+
+    report_lines.append("\n---\n🧬 Gemrate PSA")
+    if gemrate_stats:
+        total_pop = _to_int_safe(gemrate_stats.get("total_population"))
+        psa10_cnt = _to_int_safe(gemrate_stats.get("psa10_count"))
+        psa9_cnt = _to_int_safe(gemrate_stats.get("psa9_count"))
+        psa8_below_cnt = _to_int_safe(gemrate_stats.get("psa8_below_count"))
+        gem_rate = float(gemrate_stats.get("gem_mint_rate", 0.0) or 0.0)
+        report_lines.append(f"　📦 總數量：{total_pop:,} 筆")
+        report_lines.append(f"　🔟 PSA 10：{psa10_cnt:,} 筆")
+        report_lines.append(f"　9️⃣ PSA 9：{psa9_cnt:,} 筆")
+        report_lines.append(f"　8️⃣ PSA 8 以下：{psa8_below_cnt:,} 筆")
+        report_lines.append(f"　💎 滿分率：{gem_rate:.2f}%")
+    else:
+        report_lines.append("Gemrate: 無法取得 PSA 人口資料")
+
+    report_lines.append("\n---")
+    if pc_url:
+        report_lines.append(f"🔗 [查看 PriceCharting]({pc_url})")
+    if snkr_url:
+        report_lines.append(f"🔗 [查看 SNKRDUNK]({snkr_url})")
+        report_lines.append(f"🔗 [查看 SNKRDUNK 銷售歷史]({snkr_url}/sales-histories)")
+    if gemrate_stats and gemrate_stats.get("gemrate_url"):
+        report_lines.append(f"🔗 [查看 Gemrate]({gemrate_stats.get('gemrate_url')})")
+
+    final_report = "\n".join(report_lines)
+    print(final_report, force=True)
+
+    # Debug step3: 儲存最終報告
+    _debug_log("Step 3: 報告生成完成")
+    _debug_save("step3_report.md", final_report)
+
+    safe_name = re.sub(r"[^A-Za-z0-9]", "_", name)
+    safe_num = re.sub(r"[^A-Za-z0-9]", "_", str(number))
+    final_dest_dir = os.path.abspath(out_dir) if out_dir else tempfile.mkdtemp(prefix="openclaw_report_")
+    os.makedirs(final_dest_dir, exist_ok=True)
+    filepath = os.path.join(final_dest_dir, f"PKM_Vision_{safe_name}_{safe_num}.md")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(final_report)
+    print(f"✅ 報告已儲存至: {filepath}")
+
+    # 海報生成需要卡圖 URL
+    card_info_for_poster = dict(card_info)
+    card_info_for_poster["img_url"] = img_url
+    card_info_for_poster["gemrate_stats"] = gemrate_stats or {
+        "total_population": 0,
+        "psa10_count": 0,
+        "psa9_count": 0,
+        "psa8_below_count": 0,
+        "gem_mint_rate": 0.0,
+    }
+
+    if stream_mode:
+        return (
+            final_report,
+            {
+                "card_info": card_info_for_poster,
+                "snkr_records": snkr_records if snkr_records else [],
+                "pc_records": pc_records if pc_records else [],
+                "out_dir": final_dest_dir,
+                "poster_version": poster_version,
+            },
+        )
+
+    if REPORT_ONLY:
+        report_data = {
+            "card_info": card_info_for_poster,
+            "snkr_records": snkr_records if snkr_records else [],
+            "pc_records": pc_records if pc_records else [],
+        }
+        with open(os.path.join(final_dest_dir, "report_data.json"), "w", encoding="utf-8") as f:
+            json.dump(report_data, f, ensure_ascii=False, indent=2)
+
+        out_paths = await image_generator.generate_report(
+            card_info_for_poster,
+            snkr_records if snkr_records else [],
+            pc_records if pc_records else [],
+            out_dir=final_dest_dir,
+            template_version=poster_version,
+        )
+        return (final_report, out_paths)
+
+    return final_report
+
+
+async def generate_posters(poster_data):
+    if not poster_data:
+        return []
+    if poster_data.get("box_mode"):
+        out_dir = poster_data.get("out_dir")
+        box_name = poster_data.get("box_name") or "Unknown Box"
+        prizes = poster_data.get("box_prizes") or []
+        template_version = poster_data.get("poster_version", "v3")
+        ui_lang = poster_data.get("ui_lang") or str((poster_data.get("card_info") or {}).get("ui_lang", "zh"))
+        poster_path = await image_generator.generate_box_top10_poster(
+            box_name,
+            prizes,
+            out_dir=out_dir,
+            template_version=template_version,
+            ui_lang=ui_lang,
+        )
+        return [poster_path] if poster_path else []
+    return await image_generator.generate_report(
+        poster_data["card_info"],
+        poster_data["snkr_records"],
+        poster_data["pc_records"],
+        out_dir=poster_data["out_dir"],
+        template_version=poster_data.get("poster_version", "v3"),
+    )
+
+async def process_image_for_candidates(image_path, api_key, lang="zh"):
+    """(Manual Mode) Analyzes image and returns URL candidates from PC and SNKRDUNK."""
+    if not os.path.exists(image_path):
+        return None, "找不到圖片檔案"
+
+    card_info = await analyze_image_with_fallbacks(image_path, api_key, lang=lang)
+    if not card_info:
+        return None, "卡片影像辨識失敗"
+
+    if _looks_like_series_box(card_info):
+        series_code = _extract_series_code(card_info)
+        if series_code:
+            loop = asyncio.get_running_loop()
+            series_result = await loop.run_in_executor(
+                None,
+                contextvars.copy_context().run,
+                fetch_yuyutei_series_cards,
+                card_info,
+                series_code,
+            )
+            return card_info, {
+                "pc": [],
+                "snkr": [],
+                "series_cards": series_result.get("items", []),
+                "series_source_url": series_result.get("source_url", ""),
+                "series_method": series_result.get("method", ""),
+                "series_fallback_used": series_result.get("fallback_used", False),
+            }
+    
+    name = card_info.get("name", "Unknown")
+    set_code = card_info.get("set_code", "")
+    jp_name = card_info.get("jp_name", "")
+    number = str(card_info.get("number", "0"))
+    grade = card_info.get("grade", "Ungraded")
+    category = card_info.get("category", "Pokemon")
+    features = card_info.get("features", "Unknown")
+    is_alt_art = card_info.get("is_alt_art", False)
+    if isinstance(is_alt_art, str):
+        is_alt_art = is_alt_art.lower() == "true"
+    
+    features_lower = features.lower() if features else ""
+    is_flagship = any(kw in features_lower for kw in ["flagship", "旗艦賽", "flagship battle"])
+    mega_name_hint = (category.lower() == "pokemon") and _has_pokemon_mega_feature(features)
+    if any(kw in features_lower for kw in [
+        "leader parallel", "sr parallel", "sr-p", "l-p",
+        "リーダーパラレル", "コミパラ", "パラレル",
+        "alternate art", "parallel art", "manga"
+    ]):
+        is_alt_art = True
+    if is_flagship:
+        is_alt_art = True
+        
+    is_one_piece_cat = (category.lower() == "one piece")
+    raw_language = card_info.get("language", card_info.get("card_language", card_info.get("lang", "")))
+    card_language = _normalize_card_language(raw_language)
+    if is_one_piece_cat and card_language == "UNKNOWN":
+        if any(kw in features_lower for kw in ["英文版", "english version", "[en]"]):
+            card_language = "EN"
+        
+    snkr_variant_kws = []
+    if is_one_piece_cat and is_alt_art:
+        if is_flagship:
+            snkr_variant_kws = ["フラッグシップ", "フラシ", "flagship"]
+        elif any(kw in features_lower for kw in ["sr parallel", "sr-p", "スーパーレアパラレル"]):
+            snkr_variant_kws = ["sr-p"]
+        elif any(kw in features_lower for kw in ["leader parallel", "l-p", "リーダーパラレル"]):
+            snkr_variant_kws = ["l-p"]
+        elif any(kw in features_lower for kw in ["コミパラ", "manga", "コミックパラレル"]):
+            snkr_variant_kws = ["コミパラ", "コミック"]
+        elif any(kw in features_lower for kw in ["パラレル", "sr parallel", "parallel art"]):
+            snkr_variant_kws = ["パラレル", "-p"]
+
+    loop = asyncio.get_running_loop()
+    pc_result, snkr_result = await asyncio.gather(
+        loop.run_in_executor(None, contextvars.copy_context().run, search_pricecharting, name, number, set_code, grade, is_alt_art, category, is_flagship, True, "", jp_name, mega_name_hint),
+        loop.run_in_executor(None, contextvars.copy_context().run, search_snkrdunk, name, jp_name, number, set_code, grade, is_alt_art, card_language, snkr_variant_kws, True),
+    )
+    
+    pc_candidates = (pc_result[0] if pc_result else None) or []
+    snkr_candidates = (snkr_result[0] if snkr_result else None) or []
+    
+    return card_info, {
+        "pc": pc_candidates,
+        "snkr": snkr_candidates
+    }
+
+def _fetch_snkr_prices_from_url_direct(product_url):
+    product_id_match = re.search(r'apparels/(\d+)', product_url)
+    product_id = product_id_match.group(1) if product_id_match else None
+    img_url = ""
+    records = []
+    if not product_id:
+        return records, img_url
+
+    session = _create_snkr_api_session()
+    jpy_rate = get_exchange_rate()
+    hist_url = f"https://snkrdunk.com/en/v1/streetwears/{product_id}/trading-histories?perPage=100&page=1"
+    hist_data = _snkr_api_get_json(session, hist_url)
+    histories = hist_data.get("histories", []) if isinstance(hist_data, dict) else []
+
+    for h in histories:
+        date_found = _snkr_traded_date(h.get("tradedAt", ""))
+        grade_found = str(h.get("condition", "")).strip() or "Unknown"
+        price_jpy = _snkr_history_to_jpy(h, jpy_rate)
+        if date_found and grade_found and price_jpy:
+            records.append({
+                "date": date_found,
+                "price": price_jpy,
+                "grade": grade_found
+            })
+    
+    return records, img_url
+
+async def generate_report_from_selected(card_info, pc_url, snkr_url, out_dir=None, lang="zh", poster_version="v3"):
+    """
+    (Manual Mode) Generates final report + poster_data from explicitly chosen URLs.
+    Kept backward-compatible with old bot.py call signature.
+    """
+    grade = card_info.get("grade", "Ungraded")
+    loop = asyncio.get_running_loop()
+
+    pc_records, pc_img_url = [], ""
+    if pc_url:
+        res = await loop.run_in_executor(
+            None, contextvars.copy_context().run, _fetch_pc_prices_from_url, pc_url, None, False, grade
+        )
+        pc_records = res[0] if res else []
+        pc_img_url = res[2] if res else ""
+
+    snkr_records, img_url = [], ""
+    if snkr_url:
+        res = await loop.run_in_executor(
+            None, contextvars.copy_context().run, _fetch_snkr_prices_from_url_direct, snkr_url
+        )
+        snkr_records = res[0] if res else []
+        img_url = res[1] if res else ""
+
+    if not img_url and pc_img_url:
+        img_url = pc_img_url
+
+    jpy_rate = get_exchange_rate()
+
+    return await finish_report_after_selection(
+        card_info,
+        pc_records,
+        pc_url,
+        pc_img_url,
+        snkr_records,
+        img_url,
+        snkr_url,
+        jpy_rate,
+        out_dir,
+        poster_version,
+        lang,
+        stream_mode=True,
+    )
+
+if __name__ == "__main__":
+    main()

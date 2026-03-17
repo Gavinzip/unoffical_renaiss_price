@@ -2477,11 +2477,15 @@ async def process_single_image(
             return (
                 box_report,
                 {
+                    "box_mode": True,
+                    "box_name": box_name_for_display,
+                    "box_prizes": top10_prizes,
                     "card_info": dict(card_info),
                     "snkr_records": [],
                     "pc_records": [],
                     "out_dir": final_dest_dir,
                     "poster_version": poster_version,
+                    "ui_lang": lang,
                 },
             )
 
@@ -2865,6 +2869,20 @@ async def finish_report_after_selection(
 async def generate_posters(poster_data):
     if not poster_data:
         return []
+    if poster_data.get("box_mode"):
+        out_dir = poster_data.get("out_dir")
+        box_name = poster_data.get("box_name") or "Unknown Box"
+        prizes = poster_data.get("box_prizes") or []
+        template_version = poster_data.get("poster_version", "v3")
+        ui_lang = poster_data.get("ui_lang") or str((poster_data.get("card_info") or {}).get("ui_lang", "zh"))
+        poster_path = await image_generator.generate_box_top10_poster(
+            box_name,
+            prizes,
+            out_dir=out_dir,
+            template_version=template_version,
+            ui_lang=ui_lang,
+        )
+        return [poster_path] if poster_path else []
     return await image_generator.generate_report(
         poster_data["card_info"],
         poster_data["snkr_records"],
